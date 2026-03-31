@@ -132,8 +132,7 @@ def generate_response(
             )
             response.raise_for_status()
 
-            raw = response.json()
-            text = raw.get("response", "")
+            text = _extract_response_text(response)
             parsed = _extract_json(text)
             parsed.setdefault("confidence", _estimate_confidence(text))
             logger.debug("LLM response received (role=%s)", system_role)
@@ -210,6 +209,61 @@ def _extract_json(text: str) -> dict[str, Any]:
     if start != -1 and end > start:
         return json.loads(text[start:end])
     raise ValueError(f"No JSON object found in LLM response: {text[:200]!r}")
+
+
+def _extract_response_text(response: requests.Response) -> str:
+    """Extract the generated text from Ollama responses with tolerant parsing.
+
+    Some Ollama setups may return newline-delimited JSON chunks even when
+    ``stream`` is false. This helper handles both a single JSON object and
+    NDJSON chunk payloads.
+    """
+    try:
+        raw = response.json()
+    except ValueError:
+        raw = _parse_json_or_ndjson(getattr(response, "text", ""))
+
+    if isinstance(raw, dict):
+        text = raw.get("response", "")
+        if isinstance(text, str):
+            return text
+    raise ValueError("Ollama response did not include a valid 'response' string")
+
+
+def _parse_json_or_ndjson(text: str) -> dict[str, Any]:
+    """Parse either a JSON object or NDJSON payload from Ollama."""
+    payload = (text or "").strip()
+    if not payload:
+        raise ValueError("Empty response body from Ollama")
+
+    try:
+        parsed = json.loads(payload)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    chunks: list[str] = []
+    last_obj: dict[str, Any] | None = None
+    for line in payload.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            last_obj = obj
+            part = obj.get("response")
+            if isinstance(part, str):
+                chunks.append(part)
+
+    if chunks:
+        return {"response": "".join(chunks)}
+    if last_obj is not None:
+        return last_obj
+    raise ValueError(f"Unable to parse Ollama payload: {payload[:200]!r}")
 
 
 def _estimate_confidence(text: str) -> float:
