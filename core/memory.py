@@ -78,6 +78,15 @@ def init_db() -> None:
                 source_task INTEGER REFERENCES tasks(id),
                 created_at  TEXT    NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_tasks_status_created_at
+                ON tasks(status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tasks_created_at
+                ON tasks(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_step_results_task_id_step_index
+                ON step_results(task_id, step_index);
+            CREATE INDEX IF NOT EXISTS idx_knowledge_keyword
+                ON knowledge_base(keyword);
             """
         )
     logger.info("Database initialised at %s", DB_PATH)
@@ -136,11 +145,11 @@ def get_task(task_id: int) -> dict[str, Any] | None:
     return _row_to_dict(row)
 
 
-def list_tasks(limit: int = 50) -> list[dict[str, Any]]:
-    """Return most recent tasks."""
+def list_tasks(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+    """Return most recent tasks using limit/offset pagination."""
     with _get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM tasks ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
         ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
