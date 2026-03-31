@@ -86,6 +86,26 @@ class TestGenerateResponse:
         with pytest.raises(ValueError, match="No JSON"):
             _extract_json("no json here at all")
 
+    def test_handles_ndjson_payload_when_response_json_fails(self):
+        from core.llm import generate_response
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.side_effect = json.JSONDecodeError("bad", "{", 1)
+        mock_resp.text = "\n".join(
+            [
+                '{"response":"{\\"goal\\":\\"Plan\\","}',
+                '{"response":"\\"steps\\":[\\"s1\\"],\\"estimated_complexity\\":\\"low\\"}"}',
+            ]
+        )
+
+        with patch("requests.post", return_value=mock_resp):
+            result = generate_response("hello", system_role="planner")
+
+        assert result["goal"] == "Plan"
+        assert result["steps"] == ["s1"]
+        assert result["estimated_complexity"] == "low"
+
 
 # ---------------------------------------------------------------------------
 # agents.planner
@@ -133,6 +153,39 @@ class TestPlannerAgent:
         for c in ("low", "medium", "high"):
             result = agent._validate({"steps": ["s1"], "estimated_complexity": c}, "g")
             assert result["estimated_complexity"] == c
+
+    def test_timeout_uses_fallback_plan(self):
+        from agents.planner import PlannerAgent
+
+        agent = PlannerAgent()
+        with patch("agents.planner.generate_response", side_effect=RuntimeError("Read timed out")):
+            plan = agent.run("Build a portfolio website")
+        assert isinstance(plan["steps"], list)
+        assert len(plan["steps"]) >= 3
+        assert plan["estimated_complexity"] in {"low", "medium", "high"}
+        assert plan["confidence"] < 0.6
+
+    def test_non_timeout_error_is_reraised(self):
+        from agents.planner import PlannerAgent
+
+        agent = PlannerAgent()
+        with patch("agents.planner.generate_response", side_effect=RuntimeError("Connection refused")):
+            with pytest.raises(RuntimeError, match="Connection refused"):
+                agent.run("Build a portfolio website")
+
+    def test_json_decode_style_error_uses_fallback_plan(self):
+        from agents.planner import PlannerAgent
+
+        agent = PlannerAgent()
+        with patch(
+            "agents.planner.generate_response",
+            side_effect=RuntimeError("Unterminated string starting at: line 1 column 2"),
+        ):
+            plan = agent.run("Build a portfolio website")
+
+        assert isinstance(plan["steps"], list)
+        assert len(plan["steps"]) >= 3
+        assert plan["confidence"] < 0.6
 
 
 # ---------------------------------------------------------------------------
