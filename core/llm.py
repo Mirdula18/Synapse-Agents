@@ -13,6 +13,9 @@ import time
 from typing import Any
 
 import requests
+from requests import Timeout
+
+from core.settings import SETTINGS
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +23,11 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "mistral"
-REQUEST_TIMEOUT = 120  # seconds
+OLLAMA_URL = f"{SETTINGS.ollama_base_url}/api/generate"
+OLLAMA_TAGS_URL = f"{SETTINGS.ollama_base_url}/api/tags"
+DEFAULT_MODEL = SETTINGS.default_model
+CONNECT_TIMEOUT = SETTINGS.ollama_connect_timeout_s
+READ_TIMEOUT = SETTINGS.ollama_read_timeout_s
 
 SYSTEM_ROLES: dict[str, str] = {
     "planner": (
@@ -60,8 +65,8 @@ def generate_response(
     prompt: str,
     system_role: str = "executor",
     model: str = DEFAULT_MODEL,
-    retries: int = 3,
-    backoff: float = 2.0,
+    retries: int | None = None,
+    backoff: float | None = None,
 ) -> dict[str, Any]:
     """Send a prompt to Ollama and return a parsed JSON dict.
 
@@ -89,6 +94,9 @@ def generate_response(
     RuntimeError
         When all retry attempts are exhausted.
     """
+    retries = retries if retries is not None else SETTINGS.ollama_retries
+    backoff = backoff if backoff is not None else SETTINGS.ollama_retry_backoff_s
+
     system_instruction = SYSTEM_ROLES.get(system_role, SYSTEM_ROLES["executor"])
     full_prompt = f"[SYSTEM]\n{system_instruction}\n\n[USER]\n{prompt}"
 
@@ -97,6 +105,10 @@ def generate_response(
         "prompt": full_prompt,
         "stream": False,
         "format": "json",
+        "options": {
+            "temperature": SETTINGS.ollama_temperature,
+            "num_predict": SETTINGS.ollama_num_predict,
+        },
     }
 
     last_error: Exception | None = None
@@ -105,7 +117,11 @@ def generate_response(
     for attempt in range(1, retries + 1):
         try:
             logger.debug("LLM request attempt %d/%d (role=%s)", attempt, retries, system_role)
-            response = requests.post(OLLAMA_URL, json=payload, timeout=REQUEST_TIMEOUT)
+            response = requests.post(
+                OLLAMA_URL,
+                json=payload,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            )
             response.raise_for_status()
 
             raw = response.json()
@@ -117,11 +133,20 @@ def generate_response(
 
         except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
             last_error = exc
+            if isinstance(exc, Timeout):
+                logger.warning(
+                    "LLM timeout (connect=%ss, read=%ss) on attempt %d/%d",
+                    CONNECT_TIMEOUT,
+                    READ_TIMEOUT,
+                    attempt,
+                    retries,
+                )
             logger.warning(
                 "LLM attempt %d failed: %s – retrying in %.1fs", attempt, exc, wait
             )
-            time.sleep(wait)
-            wait *= 2
+            if attempt < retries:
+                time.sleep(wait)
+                wait *= 2
 
     raise RuntimeError(
         f"All {retries} LLM attempts failed. Last error: {last_error}"
@@ -131,12 +156,27 @@ def generate_response(
 def is_ollama_available(model: str = DEFAULT_MODEL) -> bool:
     """Return True when the Ollama server is reachable and the model is loaded."""
     try:
-        resp = requests.get("http://localhost:11434/api/tags", timeout=5)
+        resp = requests.get(OLLAMA_TAGS_URL, timeout=(CONNECT_TIMEOUT, 5))
         resp.raise_for_status()
         tags = resp.json().get("models", [])
         return any(t.get("name", "").startswith(model) for t in tags)
     except Exception:
         return False
+
+
+def list_available_models() -> list[str]:
+    """Return the installed Ollama model names from /api/tags."""
+    try:
+        resp = requests.get(OLLAMA_TAGS_URL, timeout=(CONNECT_TIMEOUT, 8))
+        resp.raise_for_status()
+        models = resp.json().get("models", [])
+        names = [m.get("name", "") for m in models if m.get("name")]
+        # Normalise to base names first, then keep full tags if duplicates exist.
+        base_names = [n.split(":", 1)[0] for n in names]
+        unique = sorted(set(base_names or names))
+        return unique
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
