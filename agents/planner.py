@@ -74,8 +74,8 @@ class PlannerAgent:
             plan = self._validate(raw, goal)
         except Exception as exc:
             # Planner fallback keeps the pipeline running when local LLM is slow.
-            if self._is_timeout_error(exc):
-                logger.warning("[Planner] LLM timeout; using deterministic fallback plan")
+            if self._is_recoverable_llm_error(exc):
+                logger.warning("[Planner] Recoverable LLM error (%s); using deterministic fallback plan", exc)
                 plan = self._fallback_plan(goal)
             else:
                 raise
@@ -109,9 +109,18 @@ class PlannerAgent:
         }
 
     @staticmethod
-    def _is_timeout_error(exc: Exception) -> bool:
+    def _is_recoverable_llm_error(exc: Exception) -> bool:
         text = str(exc).lower()
-        return "timed out" in text or "timeout" in text
+        recoverable_markers = (
+            "timed out",
+            "timeout",
+            "jsondecodeerror",
+            "json decode",
+            "no json object found",
+            "unterminated string",
+            "expecting value",
+        )
+        return any(marker in text for marker in recoverable_markers)
 
     def _fallback_plan(self, goal: str) -> dict[str, Any]:
         """Create a deterministic, lightweight plan without LLM calls."""
