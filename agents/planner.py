@@ -16,6 +16,7 @@ Output schema:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from core.llm import generate_response
@@ -68,8 +69,16 @@ class PlannerAgent:
         """
         logger.info("[Planner] Planning goal: %s", goal[:120])
         prompt = PLANNER_PROMPT_TEMPLATE.format(goal=goal)
-        raw = generate_response(prompt, system_role=self.role, model=self.model)
-        plan = self._validate(raw, goal)
+        try:
+            raw = generate_response(prompt, system_role=self.role, model=self.model)
+            plan = self._validate(raw, goal)
+        except Exception as exc:
+            # Planner fallback keeps the pipeline running when local LLM is slow.
+            if self._is_timeout_error(exc):
+                logger.warning("[Planner] LLM timeout; using deterministic fallback plan")
+                plan = self._fallback_plan(goal)
+            else:
+                raise
         logger.info(
             "[Planner] Plan ready – %d steps (complexity=%s, confidence=%.2f)",
             len(plan["steps"]),
@@ -97,4 +106,29 @@ class PlannerAgent:
             "steps": [str(s) for s in steps],
             "estimated_complexity": complexity,
             "confidence": raw.get("confidence", 0.7),
+        }
+
+    @staticmethod
+    def _is_timeout_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "timed out" in text or "timeout" in text
+
+    def _fallback_plan(self, goal: str) -> dict[str, Any]:
+        """Create a deterministic, lightweight plan without LLM calls."""
+        normalized_goal = goal.strip()
+        words = re.findall(r"[A-Za-z0-9_-]+", normalized_goal)
+        complexity = "high" if len(words) > 24 else "medium" if len(words) > 10 else "low"
+
+        steps = [
+            f"Clarify scope and acceptance criteria for: {normalized_goal}",
+            "Set up project structure and required dependencies",
+            "Implement the main solution incrementally and validate each part",
+            "Run checks/tests and summarize final deliverables with next steps",
+        ]
+
+        return {
+            "goal": normalized_goal,
+            "steps": steps,
+            "estimated_complexity": complexity,
+            "confidence": 0.45,
         }
