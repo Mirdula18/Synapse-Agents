@@ -30,7 +30,7 @@ CONNECT_TIMEOUT = SETTINGS.ollama_connect_timeout_s
 READ_TIMEOUT = SETTINGS.ollama_read_timeout_s
 MIN_NUM_PREDICT = 128
 ROLE_NUM_PREDICT: dict[str, int] = {
-    "planner": 320,
+    "planner": 192,
     "researcher": 420,
     "executor": SETTINGS.ollama_num_predict,
     "reflector": 220,
@@ -152,12 +152,14 @@ def generate_response(
                 )
                 # If the model is slow, request fewer tokens on the next attempt.
                 current_num_predict = max(MIN_NUM_PREDICT, int(current_num_predict * 0.7))
-            logger.warning(
-                "LLM attempt %d failed: %s – retrying in %.1fs", attempt, exc, wait
-            )
             if attempt < retries:
+                logger.warning(
+                    "LLM attempt %d failed: %s – retrying in %.1fs", attempt, exc, wait
+                )
                 time.sleep(wait)
                 wait *= 2
+            else:
+                logger.error("LLM attempt %d failed: %s – no retries left", attempt, exc)
 
     raise RuntimeError(
         f"All {retries} LLM attempts failed. Last error: {last_error}"
