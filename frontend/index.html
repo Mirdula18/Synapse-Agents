@@ -194,7 +194,8 @@
       border-radius: 10px;
     }
 
-    .controls input[type="text"] {
+    .controls input[type="text"],
+    .controls select {
       background: transparent;
       border: 1px solid rgba(255,255,255,0.06);
       border-radius: 8px;
@@ -390,7 +391,7 @@
       </div>
       <div class="status-pill" title="Ollama status">
         <div id="ollama-dot" class="status-dot"></div>
-        <span>Ollama link</span>
+        <span id="ollama-label">Ollama link</span>
       </div>
     </header>
 
@@ -403,7 +404,7 @@
         <div class="hero-metrics">
           <div class="metric">
             <div class="label">Default model</div>
-            <div class="value">mistral</div>
+            <div class="value" id="default-model">mistral</div>
           </div>
           <div class="metric">
             <div class="label">Agents</div>
@@ -427,7 +428,9 @@
             <textarea id="goal-input" placeholder="e.g. Build me a portfolio website with React and Tailwind CSS…"></textarea>
             <div class="controls">
               <label>Model
-                <input type="text" id="model-input" value="mistral" />
+                <select id="model-input">
+                  <option value="mistral">mistral</option>
+                </select>
               </label>
               <label>
                 <input type="checkbox" id="reflect-cb" checked />
@@ -469,16 +472,46 @@ const API = '';   // same-origin
 // ---------------------------------------------------------------------------
 async function checkOllama() {
   try {
-    const r = await fetch(`${API}/health`);
+    const model = document.getElementById('model-input').value || 'mistral';
+    const r = await fetch(`${API}/health?model=${encodeURIComponent(model)}`);
     const d = await r.json();
     const dot = document.getElementById('ollama-dot');
+    const label = document.getElementById('ollama-label');
     dot.classList.toggle('online', d.ollama_available);
     dot.title = d.ollama_available ? `Ollama online (${d.model})` : 'Ollama offline';
+    label.textContent = d.ollama_available ? `Ollama ready (${d.model})` : 'Ollama offline';
   } catch {
     document.getElementById('ollama-dot').classList.remove('online');
+    document.getElementById('ollama-label').textContent = 'Ollama offline';
   }
 }
-checkOllama();
+
+async function loadModels() {
+  const sel = document.getElementById('model-input');
+  try {
+    const r = await fetch(`${API}/models`);
+    const d = await r.json();
+    const models = Array.isArray(d.models) && d.models.length ? d.models : ['mistral'];
+    sel.innerHTML = models
+      .map(m => `<option value="${escHtml(m)}">${escHtml(m)}</option>`)
+      .join('');
+    if (d.default_model && models.includes(d.default_model)) {
+      sel.value = d.default_model;
+    }
+    document.getElementById('default-model').textContent = sel.value;
+  } catch {
+    sel.innerHTML = '<option value="mistral">mistral</option>';
+    document.getElementById('default-model').textContent = 'mistral';
+  }
+  checkOllama();
+}
+
+document.getElementById('model-input').addEventListener('change', () => {
+  document.getElementById('default-model').textContent = document.getElementById('model-input').value;
+  checkOllama();
+});
+
+loadModels();
 setInterval(checkOllama, 30000);
 
 // ---------------------------------------------------------------------------
@@ -501,29 +534,97 @@ async function runTask() {
   document.getElementById('timeline').innerHTML = '';
   document.getElementById('step-outputs').innerHTML = '';
 
-  addTimelineItem('plan', '📋', 'Planning task…', '');
+  addTimelineItem('plan', '📋', 'Task queued…', 'Preparing background execution');
 
   try {
-    const resp = await fetch(`${API}/run-task`, {
+    const submitResp = await fetch(`${API}/run-task-async`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ goal, model, enable_reflection: reflect }),
     });
 
-    if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.detail || resp.statusText);
+    if (!submitResp.ok) {
+      const err = await submitResp.json();
+      throw new Error(err.detail || submitResp.statusText);
     }
 
-    const data = await resp.json();
+    const submitted = await submitResp.json();
+    const data = await waitForJob(submitted.job_id);
     renderResults(data);
     loadHistory();
   } catch (e) {
-    showError(e.message);
+    const msg = String(e.message || e);
+    if (msg.includes('Read timed out')) {
+      showError('LLM timed out. Try a smaller goal, disable self-reflection, or pick a lighter model. You can also increase OLLAMA_READ_TIMEOUT_S.');
+    } else {
+      showError(msg);
+    }
     addTimelineItem('error', '❌', 'Pipeline failed', e.message);
   } finally {
     btn.disabled = false;
     btn.innerHTML = '▶ Run Task';
+  }
+}
+
+async function waitForJob(jobId) {
+  let lastEventCount = 0;
+  while (true) {
+    const r = await fetch(`${API}/run-task-async/${encodeURIComponent(jobId)}`);
+    if (!r.ok) {
+      const err = await r.json();
+      throw new Error(err.detail || 'Failed to poll task status');
+    }
+
+    const job = await r.json();
+    if (Array.isArray(job.events) && job.events.length > lastEventCount) {
+      for (let i = lastEventCount; i < job.events.length; i++) {
+        renderEvent(job.events[i]);
+      }
+      lastEventCount = job.events.length;
+    }
+
+    if (job.status === 'completed') {
+      return job.result || {};
+    }
+    if (job.status === 'failed') {
+      throw new Error(job.error || 'Task failed');
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 1200));
+  }
+}
+
+function renderEvent(evt) {
+  const event = evt.event || '';
+  if (event === 'planning_start') {
+    addTimelineItem('plan', '📋', 'Planning started', 'Breaking goal into steps');
+    return;
+  }
+  if (event === 'planning_done') {
+    const steps = ((evt.plan || {}).steps || []).length;
+    addTimelineItem('plan', '🧭', `Plan ready (${steps} steps)`, `Complexity: ${(evt.plan || {}).estimated_complexity || 'unknown'}`);
+    return;
+  }
+  if (event === 'step_start') {
+    addTimelineItem('exec', '⚙️', `Step ${(evt.step_index || 0) + 1}/${evt.total || '?'}`, (evt.step || '').substring(0, 90));
+    return;
+  }
+  if (event === 'research_done') {
+    addTimelineItem('res', '🔎', `Research done for step ${(evt.step_index || 0) + 1}`, 'Context prepared');
+    return;
+  }
+  if (event === 'execution_done') {
+    addTimelineItem('exec', '🛠️', `Execution done for step ${(evt.step_index || 0) + 1}`, 'Output generated');
+    return;
+  }
+  if (event === 'reflection_done') {
+    const score = (evt.reflection || {}).quality_score;
+    const label = score != null ? `Quality: ${Math.round(score * 100)}%` : 'Review complete';
+    addTimelineItem('refl', '🧪', `Reflection done for step ${(evt.step_index || 0) + 1}`, label);
+    return;
+  }
+  if (event === 'failed') {
+    addTimelineItem('error', '❌', 'Pipeline failed', evt.error || 'Unknown error');
   }
 }
 
