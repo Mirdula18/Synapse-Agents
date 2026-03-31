@@ -95,6 +95,23 @@ python main.py
 - **Frontend UI**: http://localhost:8000/
 - **Health check**: http://localhost:8000/health
 
+Runtime tuning via environment variables:
+
+```bash
+# Optional auth (if set, requests must include header X-API-Key)
+set SYNAPSE_API_KEY=your-secret-key
+
+# Faster failure / retry behavior for slow models
+set OLLAMA_CONNECT_TIMEOUT_S=10
+set OLLAMA_READ_TIMEOUT_S=45
+set OLLAMA_RETRIES=2
+set OLLAMA_RETRY_BACKOFF_S=1.5
+
+# Response-size and temperature tuning for speed/stability
+set OLLAMA_NUM_PREDICT=700
+set OLLAMA_TEMPERATURE=0.2
+```
+
 Custom options:
 
 ```bash
@@ -155,6 +172,28 @@ Execute a goal through the full pipeline.
 }
 ```
 
+### `POST /run-task-async`
+
+Submit a background job and return immediately with a `job_id`.
+
+```json
+{
+  "goal": "Build a portfolio website",
+  "model": "mistral",
+  "enable_reflection": true
+}
+```
+
+Response:
+
+```json
+{ "job_id": "...", "status": "queued", "goal": "Build a portfolio website" }
+```
+
+### `GET /run-task-async/{job_id}`
+
+Poll job state, progress events, and final result.
+
 ### `GET /history`
 
 Returns the 20 most recent tasks (configurable via `?limit=N`).
@@ -167,6 +206,14 @@ Returns full details for a task including all step results.
 
 ```json
 { "status": "ok", "ollama_available": true, "model": "mistral" }
+```
+
+### `GET /models`
+
+Returns installed Ollama models for UI dropdown selection.
+
+```json
+{ "models": ["mistral", "llama3"], "default_model": "mistral" }
 ```
 
 ---
