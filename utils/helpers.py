@@ -12,6 +12,7 @@ import logging
 import re
 import subprocess
 import sys
+import os
 from pathlib import Path
 from typing import Any
 
@@ -149,6 +150,19 @@ def safe_shell(
         return {"stdout": "", "stderr": msg, "return_code": 1}
 
     try:
+        if os.name == "nt" and base == "echo":
+            result = subprocess.run(
+                ["cmd", "/c", *command],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "return_code": result.returncode,
+            }
+
         result = subprocess.run(
             command,
             capture_output=True,
