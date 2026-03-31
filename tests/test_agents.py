@@ -499,9 +499,11 @@ class TestAPIRoutes:
     @pytest.fixture
     def client(self, tmp_path):
         import core.memory as mem
+        import api.routes as routes
 
         mem.DB_PATH = tmp_path / "test.db"
         mem.init_db()
+        routes._JOBS.clear()
 
         from fastapi.testclient import TestClient
         from main import app
@@ -515,6 +517,14 @@ class TestAPIRoutes:
         data = resp.json()
         assert data["status"] == "ok"
         assert data["ollama_available"] is False
+
+    def test_models_endpoint(self, client):
+        with patch("api.routes.list_available_models", return_value=["mistral", "llama3"]):
+            resp = client.get("/models")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "mistral" in data["models"]
+        assert "default_model" in data
 
     def test_history_empty(self, client):
         resp = client.get("/history")
@@ -542,6 +552,39 @@ class TestAPIRoutes:
             MockOrch.return_value.run.side_effect = RuntimeError("LLM offline")
             resp = client.post("/run-task", json={"goal": "Do something interesting"})
         assert resp.status_code == 500
+
+    def test_run_task_async_submit_and_poll(self, client):
+        mock_result = {
+            "task_id": 99,
+            "goal": "Async build",
+            "status": "completed",
+            "plan": {"goal": "Async build", "steps": ["s1"], "estimated_complexity": "low"},
+            "final_output": {
+                "goal": "Async build",
+                "total_steps": 1,
+                "completed_steps": 1,
+                "failed_steps": 0,
+                "step_outputs": [],
+                "overall_status": "completed",
+            },
+            "elapsed_seconds": 0.8,
+        }
+
+        def _submit_now(fn, *args, **kwargs):
+            fn(*args, **kwargs)
+            return MagicMock()
+
+        with patch("api.routes.Orchestrator") as MockOrch, patch("api.routes._EXECUTOR.submit", side_effect=_submit_now):
+            MockOrch.return_value.run.return_value = mock_result
+            submit = client.post("/run-task-async", json={"goal": "Build async pipeline"})
+            assert submit.status_code == 200
+            job_id = submit.json()["job_id"]
+
+            status = client.get(f"/run-task-async/{job_id}")
+            assert status.status_code == 200
+            payload = status.json()
+            assert payload["status"] == "completed"
+            assert payload["result"]["goal"] == "Async build"
 
     def test_get_task_not_found(self, client):
         resp = client.get("/task/99999")
