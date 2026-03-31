@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from api.routes import router
+from core.settings import SETTINGS
 from utils.helpers import setup_logging
 
 # ---------------------------------------------------------------------------
@@ -43,10 +44,9 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# Allow all origins during development – tighten in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=SETTINGS.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -119,7 +119,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Synapse Agents – multi-agent AI system")
     parser.add_argument("--cli", action="store_true", help="Run in CLI mode (no HTTP server)")
     parser.add_argument("--goal", type=str, help="Goal to execute (CLI mode only)")
-    parser.add_argument("--model", type=str, default="mistral", help="Ollama model name")
+    parser.add_argument("--model", type=str, default=SETTINGS.default_model, help="Ollama model name")
     parser.add_argument("--interactive", action="store_true", help="Approve plan before executing")
     parser.add_argument("--no-reflect", action="store_true", help="Disable reflection agent")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="API server host")
