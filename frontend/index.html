@@ -543,6 +543,24 @@ async function runTask() {
       body: JSON.stringify({ goal, model, enable_reflection: reflect }),
     });
 
+    if (submitResp.status === 404) {
+      // Backward compatibility: older backend builds only expose synchronous /run-task.
+      const legacyResp = await fetch(`${API}/run-task`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goal, model, enable_reflection: reflect }),
+      });
+      if (!legacyResp.ok) {
+        const legacyErr = await legacyResp.json();
+        throw new Error(legacyErr.detail || legacyResp.statusText);
+      }
+      const legacyData = await legacyResp.json();
+      renderResults(legacyData);
+      loadHistory();
+      addTimelineItem('done', '✅', 'Completed (legacy mode)', 'Server does not support async polling yet');
+      return;
+    }
+
     if (!submitResp.ok) {
       const err = await submitResp.json();
       throw new Error(err.detail || submitResp.statusText);
@@ -556,6 +574,8 @@ async function runTask() {
     const msg = String(e.message || e);
     if (msg.includes('Read timed out')) {
       showError('LLM timed out. Try a smaller goal, disable self-reflection, or pick a lighter model. You can also increase OLLAMA_READ_TIMEOUT_S.');
+    } else if (msg === 'Not Found') {
+      showError('Server route not found. Restart backend so new endpoints are loaded, or the app will run in legacy mode only.');
     } else {
       showError(msg);
     }
