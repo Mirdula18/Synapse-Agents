@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Synapse Agents</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: #0f0f1a;
+      color: #e0e0f0;
+      min-height: 100vh;
+    }
+
+    header {
+      background: linear-gradient(135deg, #1a1a2e, #16213e);
+      padding: 1.5rem 2rem;
+      border-bottom: 1px solid #2a2a4a;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    header h1 {
+      font-size: 1.6rem;
+      background: linear-gradient(90deg, #7c3aed, #06b6d4);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    header .subtitle {
+      font-size: 0.85rem;
+      color: #6b7280;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #ef4444;
+      margin-left: auto;
+      transition: background 0.3s;
+    }
+    .status-dot.online { background: #10b981; }
+
+    main {
+      max-width: 900px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+    }
+
+    .card {
+      background: #1a1a2e;
+      border: 1px solid #2a2a4a;
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .card h2 {
+      font-size: 1rem;
+      color: #a78bfa;
+      margin-bottom: 1rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    textarea {
+      width: 100%;
+      background: #0f0f1a;
+      border: 1px solid #3a3a5a;
+      border-radius: 8px;
+      color: #e0e0f0;
+      font-size: 0.95rem;
+      padding: 0.75rem;
+      resize: vertical;
+      min-height: 80px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    textarea:focus { border-color: #7c3aed; }
+
+    .controls {
+      display: flex;
+      gap: 0.75rem;
+      margin-top: 1rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .controls label {
+      font-size: 0.85rem;
+      color: #9ca3af;
+    }
+
+    .controls input[type="text"] {
+      background: #0f0f1a;
+      border: 1px solid #3a3a5a;
+      border-radius: 6px;
+      color: #e0e0f0;
+      padding: 0.4rem 0.6rem;
+      font-size: 0.85rem;
+      width: 140px;
+      outline: none;
+    }
+
+    .controls input[type="checkbox"] {
+      accent-color: #7c3aed;
+    }
+
+    button {
+      padding: 0.6rem 1.4rem;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #7c3aed, #2563eb);
+      color: white;
+    }
+    .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+    .btn-secondary {
+      background: #1f2937;
+      color: #9ca3af;
+      border: 1px solid #374151;
+    }
+    .btn-secondary:hover { background: #374151; }
+
+    /* Progress timeline */
+    .timeline { list-style: none; }
+    .timeline-item {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 0.75rem;
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 0.3s, transform 0.3s;
+    }
+    .timeline-item.visible { opacity: 1; transform: translateY(0); }
+
+    .tl-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.75rem;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .tl-icon.plan  { background: #4f46e5; }
+    .tl-icon.res   { background: #0891b2; }
+    .tl-icon.exec  { background: #059669; }
+    .tl-icon.refl  { background: #d97706; }
+    .tl-icon.done  { background: #10b981; }
+    .tl-icon.error { background: #ef4444; }
+
+    .tl-body { flex: 1; }
+    .tl-title { font-size: 0.9rem; font-weight: 600; }
+    .tl-detail { font-size: 0.8rem; color: #6b7280; margin-top: 0.2rem; }
+
+    /* Step cards */
+    .step-card {
+      background: #0f0f1a;
+      border: 1px solid #2a2a4a;
+      border-radius: 8px;
+      padding: 1rem;
+      margin-bottom: 0.75rem;
+    }
+    .step-card .step-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.5rem;
+    }
+    .step-num { color: #6b7280; font-size: 0.8rem; }
+    .badge {
+      font-size: 0.7rem;
+      padding: 0.2rem 0.5rem;
+      border-radius: 999px;
+    }
+    .badge.completed { background: #064e3b; color: #6ee7b7; }
+    .badge.failed    { background: #450a0a; color: #fca5a5; }
+    .badge.running   { background: #1e1b4b; color: #a5b4fc; }
+
+    pre {
+      background: #0a0a14;
+      border: 1px solid #1f1f3a;
+      border-radius: 6px;
+      padding: 0.75rem;
+      overflow-x: auto;
+      font-size: 0.8rem;
+      color: #a5f3fc;
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin-top: 0.5rem;
+    }
+
+    .quality-bar-wrap {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.4rem;
+    }
+    .quality-bar {
+      flex: 1;
+      height: 4px;
+      background: #1f2937;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .quality-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #ef4444, #f59e0b, #10b981);
+      border-radius: 999px;
+      transition: width 0.6s ease;
+    }
+    .quality-label { font-size: 0.75rem; color: #9ca3af; }
+
+    /* History */
+    .history-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.6rem 0;
+      border-bottom: 1px solid #1f2937;
+      cursor: pointer;
+      transition: background 0.15s;
+      border-radius: 4px;
+      padding-left: 0.5rem;
+    }
+    .history-item:hover { background: #1f1f3a; }
+    .history-item .goal-text { font-size: 0.85rem; flex: 1; }
+    .history-item .hist-meta { font-size: 0.75rem; color: #6b7280; margin-left: 1rem; }
+
+    .spinner {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border: 2px solid #3a3a5a;
+      border-top-color: #7c3aed;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .hidden { display: none !important; }
+
+    #error-banner {
+      background: #450a0a;
+      border: 1px solid #991b1b;
+      color: #fca5a5;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      margin-bottom: 1rem;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>⚡ Synapse Agents</h1>
+    <div class="subtitle">Multi-agent AI · Fully offline · Powered by Ollama</div>
+  </div>
+  <div id="ollama-dot" class="status-dot" title="Ollama status"></div>
+</header>
+
+<main>
+
+  <!-- Error banner -->
+  <div id="error-banner" class="hidden"></div>
+
+  <!-- Input card -->
+  <div class="card">
+    <h2>🎯 New Task</h2>
+    <textarea id="goal-input" placeholder="e.g. Build me a portfolio website with React and Tailwind CSS…"></textarea>
+    <div class="controls">
+      <label>Model:
+        <input type="text" id="model-input" value="mistral" />
+      </label>
+      <label>
+        <input type="checkbox" id="reflect-cb" checked />
+        Self-reflection
+      </label>
+      <button class="btn-primary" id="run-btn" onclick="runTask()">
+        ▶ Run Task
+      </button>
+      <button class="btn-secondary" onclick="clearAll()">Clear</button>
+    </div>
+  </div>
+
+  <!-- Progress card -->
+  <div class="card hidden" id="progress-card">
+    <h2>⚙️ Pipeline Progress</h2>
+    <ul class="timeline" id="timeline"></ul>
+  </div>
+
+  <!-- Results card -->
+  <div class="card hidden" id="results-card">
+    <h2>✅ Results</h2>
+    <div id="step-outputs"></div>
+  </div>
+
+  <!-- History card -->
+  <div class="card">
+    <h2>📜 Task History</h2>
+    <div id="history-list"><em style="color:#6b7280">Loading…</em></div>
+    <button class="btn-secondary" style="margin-top:0.75rem;font-size:0.8rem" onclick="loadHistory()">↺ Refresh</button>
+  </div>
+
+</main>
+
+<script>
+const API = '';   // same-origin
+
+// ---------------------------------------------------------------------------
+// Ollama status probe
+// ---------------------------------------------------------------------------
+async function checkOllama() {
+  try {
+    const r = await fetch(`${API}/health`);
+    const d = await r.json();
+    const dot = document.getElementById('ollama-dot');
+    dot.classList.toggle('online', d.ollama_available);
+    dot.title = d.ollama_available ? `Ollama online (${d.model})` : 'Ollama offline';
+  } catch {
+    document.getElementById('ollama-dot').classList.remove('online');
+  }
+}
+checkOllama();
+setInterval(checkOllama, 30000);
+
+// ---------------------------------------------------------------------------
+// Run task
+// ---------------------------------------------------------------------------
+async function runTask() {
+  const goal = document.getElementById('goal-input').value.trim();
+  if (!goal) return showError('Please enter a goal.');
+  hideError();
+
+  const model = document.getElementById('model-input').value.trim() || 'mistral';
+  const reflect = document.getElementById('reflect-cb').checked;
+
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Running…';
+
+  document.getElementById('progress-card').classList.remove('hidden');
+  document.getElementById('results-card').classList.add('hidden');
+  document.getElementById('timeline').innerHTML = '';
+  document.getElementById('step-outputs').innerHTML = '';
+
+  addTimelineItem('plan', '📋', 'Planning task…', '');
+
+  try {
+    const resp = await fetch(`${API}/run-task`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ goal, model, enable_reflection: reflect }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.detail || resp.statusText);
+    }
+
+    const data = await resp.json();
+    renderResults(data);
+    loadHistory();
+  } catch (e) {
+    showError(e.message);
+    addTimelineItem('error', '❌', 'Pipeline failed', e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '▶ Run Task';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Render results
+// ---------------------------------------------------------------------------
+function renderResults(data) {
+  const plan = data.plan || {};
+  const steps = plan.steps || [];
+  const outputs = (data.final_output || {}).step_outputs || [];
+
+  // Timeline summary
+  const tl = document.getElementById('timeline');
+  tl.innerHTML = '';
+  addTimelineItem('plan', '📋', `Plan ready – ${steps.length} steps`, `Complexity: ${plan.estimated_complexity || 'unknown'}`);
+
+  outputs.forEach((s, i) => {
+    const icon = s.status === 'completed' ? '✅' : '❌';
+    const cls  = s.status === 'completed' ? 'exec' : 'error';
+    addTimelineItem(cls, icon, `Step ${i + 1}: ${(s.step || '').substring(0, 60)}`, `Status: ${s.status}`);
+  });
+
+  addTimelineItem('done', '🎉', `Completed in ${data.elapsed_seconds}s`,
+    `${(data.final_output || {}).completed_steps || 0}/${(data.final_output || {}).total_steps || 0} steps succeeded`);
+
+  // Step output cards
+  const container = document.getElementById('step-outputs');
+  container.innerHTML = '';
+  outputs.forEach((s, i) => {
+    const card = document.createElement('div');
+    card.className = 'step-card';
+    const quality = s.quality_score != null ? s.quality_score : (s.confidence || 0);
+    card.innerHTML = `
+      <div class="step-header">
+        <span class="step-num">Step ${i + 1}</span>
+        <span class="badge ${s.status}">${s.status}</span>
+      </div>
+      <div style="font-size:0.9rem;font-weight:600;margin-bottom:0.4rem">${escHtml(s.step || '')}</div>
+      ${s.quality_score != null ? `
+        <div class="quality-bar-wrap">
+          <div class="quality-bar"><div class="quality-fill" style="width:${Math.round(quality * 100)}%"></div></div>
+          <span class="quality-label">Quality ${Math.round(quality * 100)}%</span>
+        </div>` : ''}
+      <pre>${escHtml(s.result || 'No output')}</pre>
+    `;
+    container.appendChild(card);
+  });
+
+  document.getElementById('results-card').classList.remove('hidden');
+}
+
+// ---------------------------------------------------------------------------
+// Timeline helpers
+// ---------------------------------------------------------------------------
+function addTimelineItem(cls, icon, title, detail) {
+  const li = document.createElement('li');
+  li.className = 'timeline-item';
+  li.innerHTML = `
+    <div class="tl-icon ${cls}">${icon}</div>
+    <div class="tl-body">
+      <div class="tl-title">${escHtml(title)}</div>
+      ${detail ? `<div class="tl-detail">${escHtml(detail)}</div>` : ''}
+    </div>`;
+  document.getElementById('timeline').appendChild(li);
+  requestAnimationFrame(() => li.classList.add('visible'));
+}
+
+// ---------------------------------------------------------------------------
+// History
+// ---------------------------------------------------------------------------
+async function loadHistory() {
+  const el = document.getElementById('history-list');
+  try {
+    const r = await fetch(`${API}/history?limit=10`);
+    const tasks = await r.json();
+    if (!tasks.length) { el.innerHTML = '<em style="color:#6b7280">No tasks yet.</em>'; return; }
+    el.innerHTML = tasks.map(t => `
+      <div class="history-item" onclick="loadTask(${t.id})">
+        <span class="goal-text">${escHtml((t.goal || '').substring(0, 80))}</span>
+        <span class="hist-meta"><span class="badge ${t.status}">${t.status}</span></span>
+      </div>`).join('');
+  } catch {
+    el.innerHTML = '<em style="color:#6b7280">Could not load history.</em>';
+  }
+}
+
+async function loadTask(id) {
+  try {
+    const r = await fetch(`${API}/task/${id}`);
+    const data = await r.json();
+    document.getElementById('goal-input').value = data.goal || '';
+    if (data.final_output) {
+      document.getElementById('progress-card').classList.remove('hidden');
+      renderResults({
+        plan: data.plan,
+        final_output: data.final_output,
+        elapsed_seconds: 0,
+      });
+    }
+  } catch (e) {
+    showError('Could not load task: ' + e.message);
+  }
+}
+
+loadHistory();
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+function clearAll() {
+  document.getElementById('goal-input').value = '';
+  document.getElementById('progress-card').classList.add('hidden');
+  document.getElementById('results-card').classList.add('hidden');
+  hideError();
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.textContent = '⚠ ' + msg;
+  el.classList.remove('hidden');
+}
+function hideError() { document.getElementById('error-banner').classList.add('hidden'); }
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+</script>
+</body>
+</html>
