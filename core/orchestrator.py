@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 MAX_STEP_RETRIES = 2
 
 
+def _is_timeout_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text
+
+
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
@@ -199,6 +204,10 @@ class Orchestrator:
                 step_state.research = self.researcher.run(step_text, goal=goal)
                 break
             except Exception as exc:
+                if _is_timeout_error(exc):
+                    logger.warning("[Orchestrator] Research timed out; skipping retries for this step")
+                    step_state.research = {"step": step_text, "details": "Research unavailable (timeout).", "resources": []}
+                    break
                 if attempt == MAX_STEP_RETRIES:
                     logger.error("[Orchestrator] Research failed after %d attempts: %s", attempt + 1, exc)
                     step_state.research = {"step": step_text, "details": "Research unavailable.", "resources": []}
@@ -216,6 +225,15 @@ class Orchestrator:
                 step_state.retries = attempt
                 break
             except Exception as exc:
+                if _is_timeout_error(exc):
+                    logger.warning("[Orchestrator] Execution timed out; skipping retries for this step")
+                    step_state.execution = {
+                        "step": step_text,
+                        "result": "Execution timed out. Try a lighter model, disable reflection, or increase OLLAMA_READ_TIMEOUT_S.",
+                        "status": "failed",
+                    }
+                    step_state.status = "failed"
+                    break
                 if attempt == MAX_STEP_RETRIES:
                     logger.error("[Orchestrator] Execution failed after %d attempts: %s", attempt + 1, exc)
                     step_state.execution = {
