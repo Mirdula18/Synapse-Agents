@@ -52,10 +52,10 @@ def load_settings() -> Settings:
         default_model=os.getenv("SYNAPSE_DEFAULT_MODEL", "mistral"),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         ollama_connect_timeout_s=_as_int(os.getenv("OLLAMA_CONNECT_TIMEOUT_S"), 10, minimum=1),
-        ollama_read_timeout_s=_as_int(os.getenv("OLLAMA_READ_TIMEOUT_S"), 45, minimum=5),
-        ollama_retries=_as_int(os.getenv("OLLAMA_RETRIES"), 2, minimum=1),
+        ollama_read_timeout_s=_as_int(os.getenv("OLLAMA_READ_TIMEOUT_S"), 60, minimum=5),
+        ollama_retries=_as_int(os.getenv("OLLAMA_RETRIES"), 1, minimum=1),
         ollama_retry_backoff_s=float(os.getenv("OLLAMA_RETRY_BACKOFF_S", "1.5")),
-        ollama_num_predict=_as_int(os.getenv("OLLAMA_NUM_PREDICT"), 700, minimum=64),
+        ollama_num_predict=_as_int(os.getenv("OLLAMA_NUM_PREDICT"), 520, minimum=64),
         ollama_temperature=float(os.getenv("OLLAMA_TEMPERATURE", "0.2")),
         api_history_default_limit=_as_int(os.getenv("SYNAPSE_HISTORY_LIMIT"), 20, minimum=1),
     )
