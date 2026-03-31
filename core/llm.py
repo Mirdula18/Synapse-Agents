@@ -28,6 +28,13 @@ OLLAMA_TAGS_URL = f"{SETTINGS.ollama_base_url}/api/tags"
 DEFAULT_MODEL = SETTINGS.default_model
 CONNECT_TIMEOUT = SETTINGS.ollama_connect_timeout_s
 READ_TIMEOUT = SETTINGS.ollama_read_timeout_s
+MIN_NUM_PREDICT = 128
+ROLE_NUM_PREDICT: dict[str, int] = {
+    "planner": 320,
+    "researcher": 420,
+    "executor": SETTINGS.ollama_num_predict,
+    "reflector": 220,
+}
 
 SYSTEM_ROLES: dict[str, str] = {
     "planner": (
@@ -99,17 +106,8 @@ def generate_response(
 
     system_instruction = SYSTEM_ROLES.get(system_role, SYSTEM_ROLES["executor"])
     full_prompt = f"[SYSTEM]\n{system_instruction}\n\n[USER]\n{prompt}"
-
-    payload = {
-        "model": model,
-        "prompt": full_prompt,
-        "stream": False,
-        "format": "json",
-        "options": {
-            "temperature": SETTINGS.ollama_temperature,
-            "num_predict": SETTINGS.ollama_num_predict,
-        },
-    }
+    start_num_predict = ROLE_NUM_PREDICT.get(system_role, SETTINGS.ollama_num_predict)
+    current_num_predict = max(MIN_NUM_PREDICT, start_num_predict)
 
     last_error: Exception | None = None
     wait = backoff
@@ -117,6 +115,16 @@ def generate_response(
     for attempt in range(1, retries + 1):
         try:
             logger.debug("LLM request attempt %d/%d (role=%s)", attempt, retries, system_role)
+            payload = {
+                "model": model,
+                "prompt": full_prompt,
+                "stream": False,
+                "format": "json",
+                "options": {
+                    "temperature": SETTINGS.ollama_temperature,
+                    "num_predict": current_num_predict,
+                },
+            }
             response = requests.post(
                 OLLAMA_URL,
                 json=payload,
@@ -135,12 +143,15 @@ def generate_response(
             last_error = exc
             if isinstance(exc, Timeout):
                 logger.warning(
-                    "LLM timeout (connect=%ss, read=%ss) on attempt %d/%d",
+                    "LLM timeout (connect=%ss, read=%ss, num_predict=%s) on attempt %d/%d",
                     CONNECT_TIMEOUT,
                     READ_TIMEOUT,
+                    current_num_predict,
                     attempt,
                     retries,
                 )
+                # If the model is slow, request fewer tokens on the next attempt.
+                current_num_predict = max(MIN_NUM_PREDICT, int(current_num_predict * 0.7))
             logger.warning(
                 "LLM attempt %d failed: %s – retrying in %.1fs", attempt, exc, wait
             )
