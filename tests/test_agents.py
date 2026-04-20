@@ -465,6 +465,65 @@ class TestMemory:
 
 
 # ---------------------------------------------------------------------------
+# core.orchestrator
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestrator:
+    def test_marks_step_failed_when_executor_returns_failed_status(self, tmp_path):
+        import core.memory as mem
+        from core.memory import get_step_results
+        from core.orchestrator import Orchestrator
+
+        original_db_path = mem.DB_PATH
+        mem.DB_PATH = tmp_path / "orchestrator_test.db"
+
+        try:
+            orch = Orchestrator(model="mistral", enable_reflection=True)
+            orch.planner = MagicMock()
+            orch.researcher = MagicMock()
+            orch.executor = MagicMock()
+            orch.reflector = MagicMock()
+
+            orch.planner.run.return_value = {
+                "goal": "Build feature",
+                "steps": ["Implement feature"],
+                "estimated_complexity": "low",
+            }
+            orch.researcher.run.return_value = {
+                "step": "Implement feature",
+                "details": "Use robust validation.",
+                "resources": [],
+                "best_practices": [],
+                "pitfalls": [],
+            }
+            orch.executor.run.return_value = {
+                "step": "Implement feature",
+                "result": "Execution failed: invalid schema",
+                "status": "failed",
+                "confidence": 0.2,
+            }
+
+            result = orch.run("Build feature")
+            step_results = get_step_results(result["task_id"])
+        finally:
+            mem.DB_PATH = original_db_path
+
+        assert result["final_output"]["completed_steps"] == 0
+        assert result["final_output"]["failed_steps"] == 1
+        assert result["final_output"]["overall_status"] == "partial"
+
+        step_output = result["final_output"]["step_outputs"][0]
+        assert step_output["status"] == "failed"
+        assert "Execution failed" in step_output["result"]
+
+        assert len(step_results) == 1
+        assert step_results[0]["status"] == "failed"
+
+        orch.reflector.run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # utils.helpers
 # ---------------------------------------------------------------------------
 

@@ -245,6 +245,22 @@ class Orchestrator:
                 else:
                     logger.warning("[Orchestrator] Execution attempt %d failed: %s – retrying", attempt + 1, exc)
 
+        # Treat explicit failed execution results as hard failures even when
+        # no exception was raised by the executor.
+        if not isinstance(step_state.execution, dict):
+            logger.warning(
+                "[Orchestrator] Executor returned non-dict payload (%s); marking step as failed",
+                type(step_state.execution).__name__,
+            )
+            step_state.execution = {
+                "step": step_text,
+                "result": "Execution returned an invalid payload type.",
+                "status": "failed",
+            }
+            step_state.status = "failed"
+        elif str(step_state.execution.get("status", "completed")).lower() == "failed":
+            step_state.status = "failed"
+
         self._emit("execution_done", {"step_index": step_state.index, "execution": step_state.execution})
 
         # ── Reflection ───────────────────────────────────────────────────
