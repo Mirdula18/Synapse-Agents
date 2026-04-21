@@ -28,9 +28,11 @@ from core.memory import (
     get_task,
     init_db,
     list_tasks,
+    request_async_job_cancellation,
     set_async_job_state,
+    start_async_job,
 )
-from core.orchestrator import Orchestrator
+from core.orchestrator import Orchestrator, OrchestratorCancelledError
 from core.settings import SETTINGS
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,7 @@ router = APIRouter()
 
 init_db()
 _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="synapse-job")
+_MAX_RETENTION_HOURS = 24 * 365
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +83,17 @@ class JobStatusResponse(BaseModel):
     error: str | None = None
 
 
+class CancelJobResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
+
+
+class CleanupJobsResponse(BaseModel):
+    removed: int
+    retention_hours: int
+
+
 class HealthResponse(BaseModel):
     status: str
     ollama_available: bool
@@ -108,12 +122,29 @@ def _record_event(job_id: str, event: str, data: dict[str, Any]) -> None:
     append_async_job_event(job_id, event, data)
 
 
+def _resolve_retention_hours(retention_hours: int | None) -> int:
+    if not isinstance(retention_hours, int):
+        return SETTINGS.async_job_retention_hours
+    return retention_hours
+
+
+def _run_retention_cleanup(retention_hours: int | None = None) -> None:
+    cleanup_async_jobs(retention_hours=_resolve_retention_hours(retention_hours))
+
+
 def _run_job(job_id: str, request: RunTaskRequest) -> None:
     def on_progress(event: str, data: dict[str, Any]) -> None:
         _record_event(job_id, event, data)
 
+    def cancellation_check() -> bool:
+        job = get_async_job(job_id)
+        return bool(job and job.get("status") == "cancelling")
+
     try:
-        if not set_async_job_state(job_id, status="running"):
+        start_status = start_async_job(job_id)
+        if start_status is None:
+            return
+        if start_status != "running":
             return
 
         orchestrator = Orchestrator(
@@ -121,9 +152,17 @@ def _run_job(job_id: str, request: RunTaskRequest) -> None:
             enable_reflection=request.enable_reflection,
             interactive=False,
             progress_callback=on_progress,
+            cancellation_check=cancellation_check,
         )
         result = orchestrator.run(request.goal)
+        if cancellation_check():
+            _record_event(job_id, "cancelled", {"message": "Cancelled by user request."})
+            set_async_job_state(job_id, status="cancelled", result=None, error="Cancelled by user request.")
+            return
         set_async_job_state(job_id, status="completed", result=result, error=None)
+    except OrchestratorCancelledError:
+        _record_event(job_id, "cancelled", {"message": "Cancelled by user request."})
+        set_async_job_state(job_id, status="cancelled", result=None, error="Cancelled by user request.")
     except Exception as exc:
         logger.exception("Async pipeline error: %s", exc)
         set_async_job_state(job_id, status="failed", result=None, error=str(exc))
@@ -180,9 +219,13 @@ def run_task(request: RunTaskRequest, _auth: None = Depends(_require_api_key)) -
 
 
 @router.post("/run-task-async", response_model=AsyncRunTaskResponse, tags=["Tasks"])
-def run_task_async(request: RunTaskRequest, _auth: None = Depends(_require_api_key)) -> AsyncRunTaskResponse:
+def run_task_async(
+    request: RunTaskRequest,
+    retention_hours: int | None = Query(default=None, ge=1, le=_MAX_RETENTION_HOURS),
+    _auth: None = Depends(_require_api_key),
+) -> AsyncRunTaskResponse:
     """Submit a task for background execution and return a job id."""
-    cleanup_async_jobs(retention_hours=SETTINGS.async_job_retention_hours)
+    _run_retention_cleanup(retention_hours)
 
     job_id = str(uuid.uuid4())
     create_async_job(
@@ -196,13 +239,61 @@ def run_task_async(request: RunTaskRequest, _auth: None = Depends(_require_api_k
 
 
 @router.get("/run-task-async/{job_id}", response_model=JobStatusResponse, tags=["Tasks"])
-def run_task_status(job_id: str, _auth: None = Depends(_require_api_key)) -> JobStatusResponse:
+def run_task_status(
+    job_id: str,
+    retention_hours: int | None = Query(default=None, ge=1, le=_MAX_RETENTION_HOURS),
+    _auth: None = Depends(_require_api_key),
+) -> JobStatusResponse:
     """Return background job status, events, and final result when done."""
-    cleanup_async_jobs(retention_hours=SETTINGS.async_job_retention_hours)
+    _run_retention_cleanup(retention_hours)
     job = get_async_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     return JobStatusResponse(**job)
+
+
+@router.post("/run-task-async/{job_id}/cancel", response_model=CancelJobResponse, tags=["Tasks"])
+def cancel_run_task(
+    job_id: str,
+    retention_hours: int | None = Query(default=None, ge=1, le=_MAX_RETENTION_HOURS),
+    _auth: None = Depends(_require_api_key),
+) -> CancelJobResponse:
+    """Request cancellation for a queued/running background task."""
+    _run_retention_cleanup(retention_hours)
+
+    status, transitioned = request_async_job_cancellation(job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    if status in {"completed", "failed"}:
+        raise HTTPException(status_code=409, detail=f"Job {job_id} already {status}")
+
+    if status == "running":
+        status, transitioned = request_async_job_cancellation(job_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    if status == "cancelling":
+        if transitioned:
+            _record_event(job_id, "cancellation_requested", {"message": "Cancellation requested."})
+        return CancelJobResponse(job_id=job_id, status="cancelling", message="Cancellation requested.")
+
+    if status == "cancelled":
+        if transitioned:
+            _record_event(job_id, "cancelled", {"message": "Cancelled by user request."})
+        return CancelJobResponse(job_id=job_id, status="cancelled", message="Job cancelled.")
+
+    return CancelJobResponse(job_id=job_id, status=status, message=f"Job status is {status}.")
+
+
+@router.post("/run-task-async/cleanup", response_model=CleanupJobsResponse, tags=["Tasks"])
+def cleanup_run_task_jobs(
+    retention_hours: int = Query(default=SETTINGS.async_job_retention_hours, ge=1, le=_MAX_RETENTION_HOURS),
+    _auth: None = Depends(_require_api_key),
+) -> CleanupJobsResponse:
+    """Delete terminal async jobs older than a configurable retention window."""
+    removed = cleanup_async_jobs(retention_hours=retention_hours)
+    return CleanupJobsResponse(removed=removed, retention_hours=retention_hours)
 
 
 @router.get("/history", tags=["Tasks"])

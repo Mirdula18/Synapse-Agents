@@ -43,6 +43,10 @@ def _is_timeout_error(exc: Exception) -> bool:
     return "timed out" in text or "timeout" in text
 
 
+class OrchestratorCancelledError(RuntimeError):
+    """Raised when a running pipeline is cancelled by caller request."""
+
+
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
@@ -86,6 +90,7 @@ class Orchestrator:
         enable_reflection: bool = True,
         interactive: bool = False,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        cancellation_check: Callable[[], bool] | None = None,
     ) -> None:
         """
         Parameters
@@ -99,11 +104,15 @@ class Orchestrator:
         progress_callback:
             Optional callable ``(event_name, data)`` invoked after each
             pipeline stage.  Useful for streaming progress to API clients.
+        cancellation_check:
+            Optional callable returning True when execution should be
+            cancelled. Checked between pipeline stages.
         """
         self.model = model
         self.enable_reflection = enable_reflection
         self.interactive = interactive
         self.progress_callback = progress_callback
+        self.cancellation_check = cancellation_check
 
         self.planner = PlannerAgent(model=model)
         self.researcher = ResearcherAgent(model=model)
@@ -146,6 +155,7 @@ class Orchestrator:
             ]
             update_task(state.task_id, plan=state.plan, status="running")
             self._emit("planning_done", {"plan": state.plan})
+            self._check_cancelled()
 
             # ── Interactive approval ───────────────────────────────────────
             if self.interactive:
@@ -154,6 +164,7 @@ class Orchestrator:
             # ── Stage 2: Per-step loop ─────────────────────────────────────
             state.status = "running"
             for step_state in state.steps:
+                self._check_cancelled()
                 state.current_step_index = step_state.index
                 self._run_step(state, step_state)
 
@@ -166,6 +177,14 @@ class Orchestrator:
                 final_output=state.final_output,
             )
             self._emit("completed", {"final_output": state.final_output})
+
+        except OrchestratorCancelledError as exc:
+            logger.info("[Orchestrator] Pipeline cancelled: %s", exc)
+            state.status = "cancelled"
+            if state.task_id:
+                update_task(state.task_id, status="cancelled")
+            self._emit("cancelled", {"reason": str(exc)})
+            raise
 
         except Exception as exc:
             logger.exception("[Orchestrator] Pipeline failed: %s", exc)
@@ -190,6 +209,8 @@ class Orchestrator:
         step_num = step_state.index + 1
         total = len(state.steps)
 
+        self._check_cancelled()
+
         logger.info(
             "[Orchestrator] Step %d/%d: %s", step_num, total, step_text[:80]
         )
@@ -197,6 +218,7 @@ class Orchestrator:
             "step_start",
             {"step_index": step_state.index, "step": step_text, "total": total},
         )
+        self._check_cancelled()
 
         # ── Research ──────────────────────────────────────────────────────
         for attempt in range(MAX_STEP_RETRIES + 1):
@@ -215,6 +237,7 @@ class Orchestrator:
                     logger.warning("[Orchestrator] Research attempt %d failed: %s – retrying", attempt + 1, exc)
 
         self._emit("research_done", {"step_index": step_state.index, "research": step_state.research})
+        self._check_cancelled()
 
         # ── Execution ────────────────────────────────────────────────────
         for attempt in range(MAX_STEP_RETRIES + 1):
@@ -262,6 +285,7 @@ class Orchestrator:
             step_state.status = "failed"
 
         self._emit("execution_done", {"step_index": step_state.index, "execution": step_state.execution})
+        self._check_cancelled()
 
         # ── Reflection ───────────────────────────────────────────────────
         if self.reflector and step_state.status != "failed":
@@ -280,6 +304,7 @@ class Orchestrator:
                 logger.warning("[Orchestrator] Reflection failed (non-fatal): %s", exc)
 
             self._emit("reflection_done", {"step_index": step_state.index, "reflection": step_state.reflection})
+            self._check_cancelled()
 
         if step_state.status != "failed":
             step_state.status = "completed"
@@ -364,6 +389,10 @@ class Orchestrator:
                 self.progress_callback(event, data)
             except Exception as exc:
                 logger.debug("Progress callback raised: %s", exc)
+
+    def _check_cancelled(self) -> None:
+        if self.cancellation_check and self.cancellation_check():
+            raise OrchestratorCancelledError("Cancelled by user request.")
 
     @staticmethod
     def _interactive_approve(plan: dict[str, Any]) -> None:

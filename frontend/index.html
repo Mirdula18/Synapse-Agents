@@ -195,6 +195,7 @@
     }
 
     .controls input[type="text"],
+    .controls input[type="password"],
     .controls select {
       background: transparent;
       border: 1px solid rgba(255,255,255,0.06);
@@ -300,6 +301,8 @@
     .badge.completed { background: rgba(52,211,153,0.1); color: #6ee7b7; }
     .badge.failed    { background: rgba(244,63,94,0.1); color: #fca5a5; }
     .badge.running   { background: rgba(165,180,252,0.1); color: #c7d2fe; }
+    .badge.cancelling { background: rgba(251,191,36,0.12); color: #fcd34d; }
+    .badge.cancelled  { background: rgba(244,63,94,0.16); color: #fecaca; }
 
     pre {
       background: rgba(0,0,0,0.4);
@@ -432,11 +435,15 @@
                   <option value="mistral">mistral</option>
                 </select>
               </label>
+              <label>API key
+                <input type="password" id="api-key-input" placeholder="optional" autocomplete="off" />
+              </label>
               <label>
                 <input type="checkbox" id="reflect-cb" checked />
                 Self-reflection
               </label>
               <button class="btn-primary" id="run-btn" onclick="runTask()">▶ Run Task</button>
+              <button class="btn-secondary hidden" id="cancel-btn" onclick="cancelActiveTask()">Cancel Task</button>
               <button class="btn-secondary" onclick="clearAll()">Clear</button>
             </div>
           </div>
@@ -466,6 +473,176 @@
 
 <script>
 const API = '';   // same-origin
+const API_KEY_STORAGE_KEY = 'synapse_api_key';
+const POLL_BASE_INTERVAL_MS = 1200;
+const POLL_MAX_INTERVAL_MS = 8000;
+const POLL_MAX_TRANSIENT_ERRORS = 6;
+const POLL_TIMEOUT_MS = 20 * 60 * 1000;
+
+let ACTIVE_JOB_ID = null;
+
+function getApiKey() {
+  try {
+    return (sessionStorage.getItem(API_KEY_STORAGE_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function setApiKey(value) {
+  try {
+    const trimmed = String(value || '').trim();
+    if (trimmed) {
+      sessionStorage.setItem(API_KEY_STORAGE_KEY, trimmed);
+    } else {
+      sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage errors; requests will still run without persisted key.
+  }
+}
+
+function isAuthError(err) {
+  return !!err && (err.code === 'AUTH' || err.status === 401);
+}
+
+async function readErrorDetail(response, fallback) {
+  try {
+    const data = await response.json();
+    if (data && typeof data.detail === 'string' && data.detail.trim()) {
+      return data.detail;
+    }
+  } catch {
+    // Ignore parse failures and use fallback.
+  }
+  return fallback;
+}
+
+async function apiFetch(path, options = {}) {
+  const opt = options || {};
+  const headers = { ...(opt.headers || {}) };
+  const apiKey = getApiKey();
+  if (apiKey) {
+    headers['X-API-Key'] = apiKey;
+  }
+
+  let response;
+  try {
+    response = await fetch(`${API}${path}`, { ...opt, headers });
+  } catch {
+    const err = new Error('Network request failed.');
+    err.code = 'NETWORK';
+    throw err;
+  }
+  if (response.status === 401) {
+    const detail = await readErrorDetail(response, 'Invalid or missing API key.');
+    const err = new Error(detail);
+    err.code = 'AUTH';
+    err.status = 401;
+    throw err;
+  }
+  return response;
+}
+
+function initApiKeyInput() {
+  const input = document.getElementById('api-key-input');
+  if (!input) {
+    return;
+  }
+  input.value = getApiKey();
+  input.addEventListener('change', () => {
+    setApiKey(input.value);
+    hideError();
+    checkOllama();
+    loadHistory();
+  });
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function makeHttpError(status, message, code = 'HTTP_ERROR') {
+  const err = new Error(message);
+  err.status = status;
+  err.code = code;
+  return err;
+}
+
+function isTransientPollError(err) {
+  if (!err) {
+    return false;
+  }
+  if (err.code === 'NETWORK') {
+    return true;
+  }
+  const status = Number(err.status || 0);
+  if ([408, 425, 429, 500, 502, 503, 504].includes(status)) {
+    return true;
+  }
+  const msg = String(err.message || '').toLowerCase();
+  return msg.includes('failed to fetch') || msg.includes('network request failed');
+}
+
+function setRunUiBusy(isBusy) {
+  const runBtn = document.getElementById('run-btn');
+  const cancelBtn = document.getElementById('cancel-btn');
+  if (!runBtn || !cancelBtn) {
+    return;
+  }
+
+  if (isBusy) {
+    runBtn.disabled = true;
+    runBtn.innerHTML = '<span class="spinner"></span>Running…';
+    cancelBtn.classList.remove('hidden');
+    cancelBtn.disabled = false;
+    cancelBtn.textContent = 'Cancel Task';
+    return;
+  }
+
+  runBtn.disabled = false;
+  runBtn.innerHTML = '▶ Run Task';
+  cancelBtn.disabled = true;
+  cancelBtn.classList.add('hidden');
+  cancelBtn.textContent = 'Cancel Task';
+}
+
+async function cancelActiveTask() {
+  if (!ACTIVE_JOB_ID) {
+    return;
+  }
+
+  const cancelBtn = document.getElementById('cancel-btn');
+  cancelBtn.disabled = true;
+  cancelBtn.textContent = 'Cancelling…';
+
+  try {
+    const r = await apiFetch(`/run-task-async/${encodeURIComponent(ACTIVE_JOB_ID)}/cancel`, {
+      method: 'POST',
+    });
+    if (!r.ok) {
+      const detail = await readErrorDetail(r, 'Unable to cancel this task.');
+      throw makeHttpError(r.status, detail);
+    }
+    const payload = await r.json();
+    if (payload.status === 'cancelled') {
+      addTimelineItem('error', '🛑', 'Task cancelled', payload.message || 'Cancelled by user request.');
+    } else {
+      addTimelineItem('refl', '🛑', 'Cancellation requested', payload.message || 'Waiting for safe cancellation point.');
+    }
+  } catch (e) {
+    if (isAuthError(e)) {
+      showError('Authentication failed. Enter a valid API key and retry cancellation.');
+    } else {
+      showError(String(e.message || e));
+    }
+  } finally {
+    if (ACTIVE_JOB_ID) {
+      cancelBtn.disabled = false;
+      cancelBtn.textContent = 'Cancel Task';
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Ollama status probe
@@ -473,23 +650,31 @@ const API = '';   // same-origin
 async function checkOllama() {
   try {
     const model = document.getElementById('model-input').value || 'mistral';
-    const r = await fetch(`${API}/health?model=${encodeURIComponent(model)}`);
+    const r = await apiFetch(`/health?model=${encodeURIComponent(model)}`);
     const d = await r.json();
     const dot = document.getElementById('ollama-dot');
     const label = document.getElementById('ollama-label');
     dot.classList.toggle('online', d.ollama_available);
     dot.title = d.ollama_available ? `Ollama online (${d.model})` : 'Ollama offline';
     label.textContent = d.ollama_available ? `Ollama ready (${d.model})` : 'Ollama offline';
-  } catch {
-    document.getElementById('ollama-dot').classList.remove('online');
-    document.getElementById('ollama-label').textContent = 'Ollama offline';
+  } catch (e) {
+    const dot = document.getElementById('ollama-dot');
+    const label = document.getElementById('ollama-label');
+    dot.classList.remove('online');
+    if (isAuthError(e)) {
+      label.textContent = 'Auth required';
+      dot.title = 'Authentication required';
+    } else {
+      label.textContent = 'Ollama offline';
+      dot.title = 'Ollama offline';
+    }
   }
 }
 
 async function loadModels() {
   const sel = document.getElementById('model-input');
   try {
-    const r = await fetch(`${API}/models`);
+    const r = await apiFetch('/models');
     const d = await r.json();
     const models = Array.isArray(d.models) && d.models.length ? d.models : ['mistral'];
     sel.innerHTML = models
@@ -499,9 +684,12 @@ async function loadModels() {
       sel.value = d.default_model;
     }
     document.getElementById('default-model').textContent = sel.value;
-  } catch {
+  } catch (e) {
     sel.innerHTML = '<option value="mistral">mistral</option>';
     document.getElementById('default-model').textContent = 'mistral';
+    if (isAuthError(e)) {
+      showError('Authentication required. Enter a valid API key to access models and run tasks.');
+    }
   }
   checkOllama();
 }
@@ -511,6 +699,7 @@ document.getElementById('model-input').addEventListener('change', () => {
   checkOllama();
 });
 
+initApiKeyInput();
 loadModels();
 setInterval(checkOllama, 30000);
 
@@ -525,9 +714,8 @@ async function runTask() {
   const model = document.getElementById('model-input').value.trim() || 'mistral';
   const reflect = document.getElementById('reflect-cb').checked;
 
-  const btn = document.getElementById('run-btn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Running…';
+  setRunUiBusy(true);
+  ACTIVE_JOB_ID = null;
 
   document.getElementById('progress-card').classList.remove('hidden');
   document.getElementById('results-card').classList.add('hidden');
@@ -537,7 +725,7 @@ async function runTask() {
   addTimelineItem('plan', '📋', 'Task queued…', 'Preparing background execution');
 
   try {
-    const submitResp = await fetch(`${API}/run-task-async`, {
+    const submitResp = await apiFetch('/run-task-async', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ goal, model, enable_reflection: reflect }),
@@ -545,7 +733,7 @@ async function runTask() {
 
     if (submitResp.status === 404) {
       // Backward compatibility: older backend builds only expose synchronous /run-task.
-      const legacyResp = await fetch(`${API}/run-task`, {
+      const legacyResp = await apiFetch('/run-task', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ goal, model, enable_reflection: reflect }),
@@ -567,50 +755,118 @@ async function runTask() {
     }
 
     const submitted = await submitResp.json();
+    ACTIVE_JOB_ID = submitted.job_id;
     const data = await waitForJob(submitted.job_id);
-    renderResults(data);
+    renderResults(data.result || {});
     loadHistory();
   } catch (e) {
     const msg = String(e.message || e);
-    if (msg.includes('Read timed out')) {
+    if (isAuthError(e)) {
+      showError('Authentication failed. Enter a valid API key and retry.');
+    } else if (e.code === 'CANCELLED') {
+      showError(msg || 'Task cancelled by user request.');
+      addTimelineItem('error', '🛑', 'Task cancelled', msg || 'Cancelled by user request.');
+    } else if (e.code === 'POLL_TIMEOUT') {
+      showError('Polling timed out. The task may still be running; refresh history or retry polling shortly.');
+      addTimelineItem('error', '⏱️', 'Polling timed out', 'Try refreshing history to inspect task state.');
+    } else if (e.code === 'JOB_NOT_FOUND') {
+      showError('Job status no longer available. It may have expired due to async retention settings.');
+      addTimelineItem('error', '🗑️', 'Job status expired', 'Increase retention settings or poll sooner.');
+    } else if (msg.includes('Read timed out')) {
       showError('LLM timed out. Try a smaller goal, disable self-reflection, or pick a lighter model. You can also increase OLLAMA_READ_TIMEOUT_S.');
     } else if (msg === 'Not Found') {
       showError('Server route not found. Restart backend so new endpoints are loaded, or the app will run in legacy mode only.');
     } else {
       showError(msg);
     }
-    addTimelineItem('error', '❌', 'Pipeline failed', e.message);
+    addTimelineItem('error', '❌', 'Pipeline failed', msg);
   } finally {
-    btn.disabled = false;
-    btn.innerHTML = '▶ Run Task';
+    ACTIVE_JOB_ID = null;
+    setRunUiBusy(false);
   }
 }
 
 async function waitForJob(jobId) {
   let lastEventCount = 0;
+  let consecutiveTransientErrors = 0;
+  let pollIntervalMs = POLL_BASE_INTERVAL_MS;
+  let cancellationSeen = false;
+  const startedAt = Date.now();
+
   while (true) {
-    const r = await fetch(`${API}/run-task-async/${encodeURIComponent(jobId)}`);
-    if (!r.ok) {
-      const err = await r.json();
-      throw new Error(err.detail || 'Failed to poll task status');
+    if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+      throw makeHttpError(408, 'Polling exceeded the maximum wait time.', 'POLL_TIMEOUT');
     }
 
-    const job = await r.json();
-    if (Array.isArray(job.events) && job.events.length > lastEventCount) {
-      for (let i = lastEventCount; i < job.events.length; i++) {
-        renderEvent(job.events[i]);
+    try {
+      const r = await apiFetch(`/run-task-async/${encodeURIComponent(jobId)}`);
+      if (!r.ok) {
+        const detail = await readErrorDetail(r, 'Failed to poll task status.');
+        if (r.status === 404) {
+          throw makeHttpError(404, detail, 'JOB_NOT_FOUND');
+        }
+        throw makeHttpError(r.status, detail);
       }
-      lastEventCount = job.events.length;
-    }
 
-    if (job.status === 'completed') {
-      return job.result || {};
-    }
-    if (job.status === 'failed') {
-      throw new Error(job.error || 'Task failed');
-    }
+      const job = await r.json();
+      if (Array.isArray(job.events) && job.events.length > lastEventCount) {
+        for (let i = lastEventCount; i < job.events.length; i++) {
+          renderEvent(job.events[i]);
+        }
+        lastEventCount = job.events.length;
+      }
 
-    await new Promise(resolve => setTimeout(resolve, 1200));
+      if (job.status === 'cancelling' && !cancellationSeen) {
+        cancellationSeen = true;
+        addTimelineItem('refl', '🛑', 'Cancellation in progress', 'Stopping at next safe checkpoint.');
+      }
+
+      if (consecutiveTransientErrors > 0) {
+        addTimelineItem('done', '📶', 'Polling recovered', 'Reconnected to live task status.');
+      }
+      consecutiveTransientErrors = 0;
+      pollIntervalMs = POLL_BASE_INTERVAL_MS;
+
+      if (job.status === 'completed') {
+        return job;
+      }
+      if (job.status === 'failed') {
+        throw new Error(job.error || 'Task failed');
+      }
+      if (job.status === 'cancelled') {
+        const cancelled = new Error(job.error || 'Task cancelled by user request.');
+        cancelled.code = 'CANCELLED';
+        throw cancelled;
+      }
+
+      await sleep(pollIntervalMs);
+      continue;
+    } catch (err) {
+      if (isAuthError(err)) {
+        throw err;
+      }
+      if (err.code === 'JOB_NOT_FOUND' || err.code === 'POLL_TIMEOUT' || err.code === 'CANCELLED') {
+        throw err;
+      }
+      if (!isTransientPollError(err)) {
+        throw err;
+      }
+
+      consecutiveTransientErrors += 1;
+      if (consecutiveTransientErrors > POLL_MAX_TRANSIENT_ERRORS) {
+        throw new Error('Lost connection while polling task status. Please retry.');
+      }
+
+      addTimelineItem(
+        'refl',
+        '📡',
+        `Polling retry ${consecutiveTransientErrors}/${POLL_MAX_TRANSIENT_ERRORS}`,
+        'Transient connection issue detected; retrying with backoff.'
+      );
+
+      pollIntervalMs = Math.min(POLL_MAX_INTERVAL_MS, Math.round(pollIntervalMs * 1.5));
+      await sleep(pollIntervalMs);
+    }
   }
 }
 
@@ -645,6 +901,14 @@ function renderEvent(evt) {
   }
   if (event === 'failed') {
     addTimelineItem('error', '❌', 'Pipeline failed', evt.error || 'Unknown error');
+    return;
+  }
+  if (event === 'cancelled') {
+    addTimelineItem('error', '🛑', 'Task cancelled', evt.message || 'Cancelled by user request.');
+    return;
+  }
+  if (event === 'cancellation_requested') {
+    addTimelineItem('refl', '🛑', 'Cancellation requested', evt.message || 'Stopping soon.');
   }
 }
 
@@ -718,7 +982,7 @@ function addTimelineItem(cls, icon, title, detail) {
 async function loadHistory() {
   const el = document.getElementById('history-list');
   try {
-    const r = await fetch(`${API}/history?limit=10`);
+    const r = await apiFetch('/history?limit=10');
     const tasks = await r.json();
     if (!tasks.length) { el.innerHTML = '<em style="color:#6b7280">No tasks yet.</em>'; return; }
     el.innerHTML = tasks.map(t => `
@@ -726,14 +990,19 @@ async function loadHistory() {
         <span class="goal-text">${escHtml((t.goal || '').substring(0, 80))}</span>
         <span class="hist-meta"><span class="badge ${t.status}">${t.status}</span></span>
       </div>`).join('');
-  } catch {
+  } catch (e) {
+    if (isAuthError(e)) {
+      el.innerHTML = '<em style="color:#6b7280">Authentication required. Enter API key.</em>';
+      showError('Authentication required. Enter a valid API key to load history.');
+      return;
+    }
     el.innerHTML = '<em style="color:#6b7280">Could not load history.</em>';
   }
 }
 
 async function loadTask(id) {
   try {
-    const r = await fetch(`${API}/task/${id}`);
+    const r = await apiFetch(`/task/${id}`);
     const data = await r.json();
     document.getElementById('goal-input').value = data.goal || '';
     if (data.final_output) {
@@ -745,6 +1014,10 @@ async function loadTask(id) {
       });
     }
   } catch (e) {
+    if (isAuthError(e)) {
+      showError('Authentication required. Enter a valid API key to view this task.');
+      return;
+    }
     showError('Could not load task: ' + e.message);
   }
 }
@@ -758,6 +1031,8 @@ function clearAll() {
   document.getElementById('goal-input').value = '';
   document.getElementById('progress-card').classList.add('hidden');
   document.getElementById('results-card').classList.add('hidden');
+  ACTIVE_JOB_ID = null;
+  setRunUiBusy(false);
   hideError();
 }
 

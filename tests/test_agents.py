@@ -7,7 +7,9 @@ running Ollama instance.
 
 from __future__ import annotations
 
+import importlib
 import json
+import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -105,6 +107,83 @@ class TestGenerateResponse:
         assert result["goal"] == "Plan"
         assert result["steps"] == ["s1"]
         assert result["estimated_complexity"] == "low"
+
+
+# ---------------------------------------------------------------------------
+# core.settings
+# ---------------------------------------------------------------------------
+
+
+class TestSettings:
+    def test_dev_defaults_use_explicit_local_origins_with_credentials(self, monkeypatch):
+        from core.settings import load_settings
+
+        monkeypatch.delenv("SYNAPSE_ENV", raising=False)
+        monkeypatch.delenv("SYNAPSE_CORS_ORIGINS", raising=False)
+        monkeypatch.delenv("SYNAPSE_CORS_ALLOW_CREDENTIALS", raising=False)
+
+        settings = load_settings()
+        assert settings.environment == "development"
+        assert settings.cors_allow_credentials is True
+        assert "*" not in settings.cors_origins
+        assert any("localhost" in origin for origin in settings.cors_origins)
+
+    def test_rejects_wildcard_when_credentials_enabled(self, monkeypatch):
+        from core.settings import load_settings
+
+        monkeypatch.setenv("SYNAPSE_CORS_ORIGINS", "*")
+        monkeypatch.setenv("SYNAPSE_CORS_ALLOW_CREDENTIALS", "true")
+
+        with pytest.raises(ValueError, match="Wildcard"):
+            load_settings()
+
+    def test_requires_explicit_origins_in_production_with_credentials(self, monkeypatch):
+        from core.settings import load_settings
+
+        monkeypatch.setenv("SYNAPSE_ENV", "production")
+        monkeypatch.delenv("SYNAPSE_CORS_ORIGINS", raising=False)
+        monkeypatch.setenv("SYNAPSE_CORS_ALLOW_CREDENTIALS", "true")
+
+        with pytest.raises(ValueError, match="Explicit SYNAPSE_CORS_ORIGINS"):
+            load_settings()
+
+    def test_allows_wildcard_when_credentials_disabled(self, monkeypatch):
+        from core.settings import load_settings
+
+        monkeypatch.setenv("SYNAPSE_CORS_ORIGINS", "*")
+        monkeypatch.setenv("SYNAPSE_CORS_ALLOW_CREDENTIALS", "false")
+
+        settings = load_settings()
+        assert settings.cors_allow_credentials is False
+        assert settings.cors_origins == ["*"]
+
+    def test_invalid_float_env_values_fallback_to_defaults_with_warning(self, monkeypatch, caplog):
+        from core.settings import load_settings
+
+        monkeypatch.setenv("OLLAMA_RETRY_BACKOFF_S", "not-a-number")
+        monkeypatch.setenv("OLLAMA_TEMPERATURE", "totally-bad")
+
+        caplog.set_level("WARNING")
+        settings = load_settings()
+
+        assert settings.ollama_retry_backoff_s == 1.5
+        assert settings.ollama_temperature == 0.2
+        assert "OLLAMA_RETRY_BACKOFF_S" in caplog.text
+        assert "OLLAMA_TEMPERATURE" in caplog.text
+
+    def test_float_env_values_are_clamped_to_bounds_with_warning(self, monkeypatch, caplog):
+        from core.settings import load_settings
+
+        monkeypatch.setenv("OLLAMA_RETRY_BACKOFF_S", "-10")
+        monkeypatch.setenv("OLLAMA_TEMPERATURE", "99")
+
+        caplog.set_level("WARNING")
+        settings = load_settings()
+
+        assert settings.ollama_retry_backoff_s == 0.1
+        assert settings.ollama_temperature == 2.0
+        assert "clamping to minimum" in caplog.text
+        assert "clamping to maximum" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +542,80 @@ class TestMemory:
         results = search_knowledge("")
         assert results == []
 
+    def test_async_job_lifecycle(self):
+        from core.memory import (
+            append_async_job_event,
+            create_async_job,
+            get_async_job,
+            set_async_job_state,
+        )
+
+        create_async_job(job_id="job-1", goal="Build async", model="mistral", status="pending")
+
+        assert append_async_job_event("job-1", "planning_start", {"goal": "Build async"})
+        assert set_async_job_state("job-1", status="running")
+        assert set_async_job_state(
+            "job-1",
+            status="completed",
+            result={"task_id": 10, "status": "completed"},
+            error=None,
+        )
+
+        job = get_async_job("job-1")
+        assert job is not None
+        assert job["status"] == "completed"
+        assert job["result"]["task_id"] == 10
+        assert isinstance(job["events"], list)
+        assert job["events"][0]["event"] == "planning_start"
+        assert isinstance(job["created_at"], float)
+        assert isinstance(job["updated_at"], float)
+
+    def test_cleanup_async_jobs_removes_only_expired_terminal_jobs(self):
+        from core.memory import cleanup_async_jobs, create_async_job, get_async_job, set_async_job_state
+
+        create_async_job(job_id="done-job", goal="Done", model="mistral", status="pending")
+        create_async_job(job_id="running-job", goal="Running", model="mistral", status="pending")
+        set_async_job_state("done-job", status="completed", result={"ok": True}, error=None)
+        set_async_job_state("running-job", status="running")
+
+        removed = cleanup_async_jobs(retention_hours=24, now_ts=10_000_000_000)
+        assert removed == 1
+        assert get_async_job("done-job") is None
+        assert get_async_job("running-job") is not None
+
+    def test_request_async_job_cancellation_transitions_pending_and_running(self):
+        from core.memory import (
+            create_async_job,
+            get_async_job,
+            request_async_job_cancellation,
+            set_async_job_state,
+        )
+
+        create_async_job(job_id="pending-job", goal="Pending", model="mistral", status="pending")
+        status, changed = request_async_job_cancellation("pending-job")
+        assert status == "cancelled"
+        assert changed is True
+        pending_job = get_async_job("pending-job")
+        assert pending_job is not None
+        assert pending_job["status"] == "cancelled"
+
+        create_async_job(job_id="running-job", goal="Running", model="mistral", status="pending")
+        set_async_job_state("running-job", status="running")
+        status, changed = request_async_job_cancellation("running-job")
+        assert status == "cancelling"
+        assert changed is True
+        running_job = get_async_job("running-job")
+        assert running_job is not None
+        assert running_job["status"] == "cancelling"
+
+    def test_start_async_job_does_not_restart_cancelled_job(self):
+        from core.memory import create_async_job, request_async_job_cancellation, start_async_job
+
+        create_async_job(job_id="cancelled-job", goal="Cancelled", model="mistral", status="pending")
+        request_async_job_cancellation("cancelled-job")
+        state = start_async_job("cancelled-job")
+        assert state == "cancelled"
+
 
 # ---------------------------------------------------------------------------
 # core.orchestrator
@@ -521,6 +674,31 @@ class TestOrchestrator:
         assert step_results[0]["status"] == "failed"
 
         orch.reflector.run.assert_not_called()
+
+    def test_marks_task_cancelled_when_cancellation_check_requests_stop(self, tmp_path):
+        import core.memory as mem
+        from core.memory import list_tasks
+        from core.orchestrator import Orchestrator, OrchestratorCancelledError
+
+        original_db_path = mem.DB_PATH
+        mem.DB_PATH = tmp_path / "orchestrator_cancel_test.db"
+
+        try:
+            orch = Orchestrator(model="mistral", cancellation_check=lambda: True)
+            orch.planner = MagicMock()
+            orch.planner.run.return_value = {
+                "goal": "Cancel goal",
+                "steps": ["s1"],
+                "estimated_complexity": "low",
+            }
+
+            with pytest.raises(OrchestratorCancelledError, match="Cancelled"):
+                orch.run("Cancel goal")
+
+            tasks = list_tasks(limit=1)
+            assert tasks[0]["status"] == "cancelled"
+        finally:
+            mem.DB_PATH = original_db_path
 
     def test_marks_step_failed_when_executor_status_is_case_insensitive(self, tmp_path):
         import core.memory as mem
@@ -759,11 +937,9 @@ class TestAPIRoutes:
     @pytest.fixture
     def client(self, tmp_path):
         import core.memory as mem
-        import api.routes as routes
 
         mem.DB_PATH = tmp_path / "test.db"
         mem.init_db()
-        routes._JOBS.clear()
 
         from fastapi.testclient import TestClient
         from main import app
@@ -858,6 +1034,78 @@ class TestAPIRoutes:
             payload = status.json()
             assert payload["status"] == "completed"
             assert payload["result"]["goal"] == "Async build"
+
+    def test_run_task_async_status_survives_routes_reload(self, client):
+        import api.routes as routes
+
+        def _submit_noop(fn, *args, **kwargs):
+            # Simulate queued job persistence without immediate worker execution.
+            return MagicMock()
+
+        with patch("api.routes._EXECUTOR.submit", side_effect=_submit_noop):
+            submit = client.post("/run-task-async", json={"goal": "Persist me"})
+            assert submit.status_code == 200
+            job_id = submit.json()["job_id"]
+
+        reloaded_routes = importlib.reload(routes)
+        job_status = reloaded_routes.run_task_status(job_id=job_id, _auth=None)
+
+        assert job_status.job_id == job_id
+        assert job_status.status == "pending"
+        assert job_status.goal == "Persist me"
+
+    def test_run_task_async_cancel_pending_job(self, client):
+        with patch("api.routes._EXECUTOR.submit", return_value=MagicMock()):
+            submit = client.post("/run-task-async", json={"goal": "Cancel me"})
+            assert submit.status_code == 200
+            job_id = submit.json()["job_id"]
+
+        cancel = client.post(f"/run-task-async/{job_id}/cancel")
+        assert cancel.status_code == 200
+        payload = cancel.json()
+        assert payload["status"] == "cancelled"
+
+        polled = client.get(f"/run-task-async/{job_id}")
+        assert polled.status_code == 200
+        assert polled.json()["status"] == "cancelled"
+
+    def test_run_task_async_cancel_running_job_returns_cancelling(self, client):
+        from core.memory import create_async_job, set_async_job_state
+
+        create_async_job(job_id="job-running", goal="Running", model="mistral", status="pending")
+        set_async_job_state("job-running", status="running")
+
+        cancel = client.post("/run-task-async/job-running/cancel")
+        assert cancel.status_code == 200
+        payload = cancel.json()
+        assert payload["status"] == "cancelling"
+
+    def test_run_task_async_cancel_completed_job_conflict(self, client):
+        from core.memory import create_async_job, set_async_job_state
+
+        create_async_job(job_id="job-complete", goal="Done", model="mistral", status="pending")
+        set_async_job_state("job-complete", status="completed", result={"ok": True}, error=None)
+
+        cancel = client.post("/run-task-async/job-complete/cancel")
+        assert cancel.status_code == 409
+
+    def test_run_task_async_cleanup_endpoint_applies_retention_query(self, client):
+        import core.memory as mem
+        from core.memory import create_async_job, get_async_job, set_async_job_state
+
+        create_async_job(job_id="job-old", goal="Old", model="mistral", status="pending")
+        set_async_job_state("job-old", status="completed", result={"ok": True}, error=None)
+
+        with sqlite3.connect(mem.DB_PATH) as conn:
+            conn.execute("UPDATE async_jobs SET updated_at = ? WHERE job_id = ?", (0.0, "job-old"))
+            conn.commit()
+
+        cleanup = client.post("/run-task-async/cleanup?retention_hours=1")
+        assert cleanup.status_code == 200
+        payload = cleanup.json()
+        assert payload["retention_hours"] == 1
+        assert payload["removed"] >= 1
+        assert get_async_job("job-old") is None
 
     def test_get_task_not_found(self, client):
         resp = client.get("/task/99999")
