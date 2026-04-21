@@ -33,7 +33,7 @@ User Goal ──► Planner ──► Researcher ──► Executor ──► Re
 ├── frontend/
 │   └── index.html       # Single-file React-free UI (served by FastAPI)
 ├── tests/
-│   └── test_agents.py   # 49 unit tests (all offline, fully mocked)
+│   └── test_agents.py   # 64 unit tests (all offline, fully mocked)
 ├── main.py              # Entry point (API server or CLI)
 └── requirements.txt
 ```
@@ -101,6 +101,9 @@ Runtime tuning via environment variables:
 # Optional auth (if set, requests must include header X-API-Key)
 set SYNAPSE_API_KEY=your-secret-key
 
+# Default model used by API/UI when not overridden in request
+set SYNAPSE_DEFAULT_MODEL=mistral
+
 # Faster failure / retry behavior for slow models
 set OLLAMA_CONNECT_TIMEOUT_S=10
 set OLLAMA_READ_TIMEOUT_S=45
@@ -139,6 +142,23 @@ python main.py --cli --no-reflect --goal "Write a sorting algorithm"
 ---
 
 ## API Endpoints
+
+API mode is always non-interactive. For human approval before execution,
+use CLI mode with `--interactive`.
+
+### Authentication (optional)
+
+If `SYNAPSE_API_KEY` is set, include `X-API-Key` in every API request.
+
+```bash
+curl -X POST http://localhost:8000/run-task \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key" \
+  -d '{"goal":"Build a portfolio website","model":"mistral","enable_reflection":true}'
+```
+
+Frontend UI note:
+- The built-in UI includes an API key input and sends `X-API-Key` automatically when provided.
 
 ### `POST /run-task`
 
@@ -268,14 +288,14 @@ hints = search_knowledge("FastAPI routing")
 | SQLite task history | ✅ |
 | Knowledge base (reusable memory) | ✅ |
 | Error handling with retries | ✅ |
-| Interactive plan approval | ✅ |
+| Interactive plan approval (CLI mode) | ✅ |
 | FastAPI REST API | ✅ |
 | Web UI (single-file, no build step) | ✅ |
 | Safe shell execution | ✅ |
 | File reader / writer utilities | ✅ |
 | Plugin system (dynamic agent loading) | ✅ |
 | Progress callback / streaming | ✅ |
-| Full unit test suite (49 tests) | ✅ |
+| Full unit test suite (64 tests) | ✅ |
 
 ---
 
@@ -285,7 +305,7 @@ hints = search_knowledge("FastAPI routing")
 pytest tests/ -v
 ```
 
-All 49 tests run completely offline (Ollama is mocked).
+All 64 tests run completely offline (Ollama is mocked).
 
 ---
 
@@ -306,12 +326,33 @@ MyAgent = load_agent_plugin("plugins.my_agent.MyAgent")
 
 ---
 
+## CORS Configuration (Brief)
+
+- CORS is environment-driven.
+- Credentials are enabled by default (`SYNAPSE_CORS_ALLOW_CREDENTIALS=true`).
+- When credentials are enabled, wildcard origin `*` is rejected at startup.
+- In development (`SYNAPSE_ENV=development`), safe localhost origins are allowed by default.
+- In production (`SYNAPSE_ENV=production`), set explicit `SYNAPSE_CORS_ORIGINS`.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLLAMA_MODEL` | `mistral` | Default Ollama model |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
+| `SYNAPSE_API_KEY` | unset | If set, API requires `X-API-Key` header |
+| `SYNAPSE_DEFAULT_MODEL` | `mistral` | Default model for API/UI requests |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+| `SYNAPSE_ENV` | `development` | Runtime mode (`development` or `production`) |
+| `SYNAPSE_CORS_ALLOW_CREDENTIALS` | `true` | Enables credentialed CORS |
+| `SYNAPSE_CORS_ORIGINS` | localhost defaults in dev | Comma-separated allowed origins |
+| `SYNAPSE_HISTORY_LIMIT` | `20` | Default `/history` limit |
+| `OLLAMA_CONNECT_TIMEOUT_S` | `10` | Ollama connect timeout (seconds) |
+| `OLLAMA_READ_TIMEOUT_S` | `60` | Ollama read timeout (seconds) |
+| `OLLAMA_RETRIES` | `1` | LLM request retry attempts |
+| `OLLAMA_RETRY_BACKOFF_S` | `1.5` | Initial retry backoff (seconds) |
+| `OLLAMA_NUM_PREDICT` | `520` | Max token budget per generation |
+| `OLLAMA_TEMPERATURE` | `0.2` | LLM sampling temperature |
 
 ---
 

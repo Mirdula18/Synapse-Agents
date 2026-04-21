@@ -47,7 +47,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=SETTINGS.cors_origins,
-    allow_credentials=True,
+    allow_credentials=SETTINGS.cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
