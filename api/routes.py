@@ -11,8 +11,6 @@ Endpoints:
 from __future__ import annotations
 
 import logging
-import threading
-import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -21,7 +19,17 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.llm import is_ollama_available, list_available_models
-from core.memory import get_step_results, get_task, init_db, list_tasks
+from core.memory import (
+    append_async_job_event,
+    cleanup_async_jobs,
+    create_async_job,
+    get_async_job,
+    get_step_results,
+    get_task,
+    init_db,
+    list_tasks,
+    set_async_job_state,
+)
 from core.orchestrator import Orchestrator
 from core.settings import SETTINGS
 
@@ -29,8 +37,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 init_db()
-_JOBS: dict[str, dict[str, Any]] = {}
-_JOBS_LOCK = threading.Lock()
 _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="synapse-job")
 
 
@@ -99,12 +105,7 @@ def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
 
 
 def _record_event(job_id: str, event: str, data: dict[str, Any]) -> None:
-    with _JOBS_LOCK:
-        job = _JOBS.get(job_id)
-        if not job:
-            return
-        job["events"].append({"event": event, "ts": time.time(), **data})
-        job["updated_at"] = time.time()
+    append_async_job_event(job_id, event, data)
 
 
 def _run_job(job_id: str, request: RunTaskRequest) -> None:
@@ -112,11 +113,8 @@ def _run_job(job_id: str, request: RunTaskRequest) -> None:
         _record_event(job_id, event, data)
 
     try:
-        with _JOBS_LOCK:
-            if job_id not in _JOBS:
-                return
-            _JOBS[job_id]["status"] = "running"
-            _JOBS[job_id]["updated_at"] = time.time()
+        if not set_async_job_state(job_id, status="running"):
+            return
 
         orchestrator = Orchestrator(
             model=request.model,
@@ -125,18 +123,10 @@ def _run_job(job_id: str, request: RunTaskRequest) -> None:
             progress_callback=on_progress,
         )
         result = orchestrator.run(request.goal)
-        with _JOBS_LOCK:
-            if job_id in _JOBS:
-                _JOBS[job_id]["status"] = "completed"
-                _JOBS[job_id]["result"] = result
-                _JOBS[job_id]["updated_at"] = time.time()
+        set_async_job_state(job_id, status="completed", result=result, error=None)
     except Exception as exc:
         logger.exception("Async pipeline error: %s", exc)
-        with _JOBS_LOCK:
-            if job_id in _JOBS:
-                _JOBS[job_id]["status"] = "failed"
-                _JOBS[job_id]["error"] = str(exc)
-                _JOBS[job_id]["updated_at"] = time.time()
+        set_async_job_state(job_id, status="failed", result=None, error=str(exc))
 
 
 @router.get("/health", response_model=HealthResponse, tags=["System"])
@@ -192,20 +182,15 @@ def run_task(request: RunTaskRequest, _auth: None = Depends(_require_api_key)) -
 @router.post("/run-task-async", response_model=AsyncRunTaskResponse, tags=["Tasks"])
 def run_task_async(request: RunTaskRequest, _auth: None = Depends(_require_api_key)) -> AsyncRunTaskResponse:
     """Submit a task for background execution and return a job id."""
+    cleanup_async_jobs(retention_hours=SETTINGS.async_job_retention_hours)
+
     job_id = str(uuid.uuid4())
-    now = time.time()
-    with _JOBS_LOCK:
-        _JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "goal": request.goal,
-            "model": request.model,
-            "created_at": now,
-            "updated_at": now,
-            "events": [],
-            "result": None,
-            "error": None,
-        }
+    create_async_job(
+        job_id=job_id,
+        goal=request.goal,
+        model=request.model,
+        status="pending",
+    )
     _EXECUTOR.submit(_run_job, job_id, request)
     return AsyncRunTaskResponse(job_id=job_id, status="queued", goal=request.goal)
 
@@ -213,11 +198,11 @@ def run_task_async(request: RunTaskRequest, _auth: None = Depends(_require_api_k
 @router.get("/run-task-async/{job_id}", response_model=JobStatusResponse, tags=["Tasks"])
 def run_task_status(job_id: str, _auth: None = Depends(_require_api_key)) -> JobStatusResponse:
     """Return background job status, events, and final result when done."""
-    with _JOBS_LOCK:
-        job = _JOBS.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-        return JobStatusResponse(**job)
+    cleanup_async_jobs(retention_hours=SETTINGS.async_job_retention_hours)
+    job = get_async_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    return JobStatusResponse(**job)
 
 
 @router.get("/history", tags=["Tasks"])
