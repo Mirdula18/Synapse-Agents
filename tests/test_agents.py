@@ -807,6 +807,19 @@ class TestAPIRoutes:
         data = resp.json()
         assert data["goal"] == "Build portfolio"
 
+    def test_run_task_rejects_interactive_field(self, client):
+        resp = client.post(
+            "/run-task",
+            json={
+                "goal": "Build portfolio website",
+                "interactive": True,
+            },
+        )
+
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "detail" in body
+
     def test_run_task_pipeline_error(self, client):
         with patch("api.routes.Orchestrator") as MockOrch:
             MockOrch.return_value.run.side_effect = RuntimeError("LLM offline")
