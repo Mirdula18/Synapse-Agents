@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from core.llm import is_ollama_available, list_available_models
 from core.memory import get_step_results, get_task, init_db, list_tasks
@@ -40,13 +40,11 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="synapse-job")
 
 
 class RunTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     goal: str = Field(..., min_length=5, max_length=2000, description="The user's high-level goal")
     model: str = Field("mistral", description="Ollama model name to use")
     enable_reflection: bool = Field(True, description="Run reflector agent after each step")
-    interactive: bool = Field(
-        False,
-        description="If true, return the plan first and require a separate /approve call",
-    )
 
 
 class RunTaskResponse(BaseModel):
@@ -166,7 +164,7 @@ def run_task(request: RunTaskRequest, _auth: None = Depends(_require_api_key)) -
     """Execute a user goal through the full Planner→Researcher→Executor→Reflector pipeline.
 
     This call is **synchronous** – it blocks until the pipeline completes.
-    For long tasks consider the async variant (future work).
+    API execution is always non-interactive; use CLI mode for manual plan approval.
     """
     logger.info("POST /run-task – goal=%s", request.goal[:80])
 

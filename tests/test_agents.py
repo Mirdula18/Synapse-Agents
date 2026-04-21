@@ -522,6 +522,154 @@ class TestOrchestrator:
 
         orch.reflector.run.assert_not_called()
 
+    def test_marks_step_failed_when_executor_status_is_case_insensitive(self, tmp_path):
+        import core.memory as mem
+        from core.memory import get_step_results
+        from core.orchestrator import Orchestrator
+
+        original_db_path = mem.DB_PATH
+        mem.DB_PATH = tmp_path / "orchestrator_test_case_insensitive.db"
+
+        try:
+            orch = Orchestrator(model="mistral", enable_reflection=True)
+            orch.planner = MagicMock()
+            orch.researcher = MagicMock()
+            orch.executor = MagicMock()
+            orch.reflector = MagicMock()
+
+            orch.planner.run.return_value = {
+                "goal": "Build feature",
+                "steps": ["Implement feature"],
+                "estimated_complexity": "low",
+            }
+            orch.researcher.run.return_value = {
+                "step": "Implement feature",
+                "details": "Use robust validation.",
+                "resources": [],
+                "best_practices": [],
+                "pitfalls": [],
+            }
+            orch.executor.run.return_value = {
+                "step": "Implement feature",
+                "result": "Execution failed: uppercase status",
+                "status": "FAILED",
+                "confidence": 0.2,
+            }
+
+            result = orch.run("Build feature")
+            step_results = get_step_results(result["task_id"])
+        finally:
+            mem.DB_PATH = original_db_path
+
+        assert result["final_output"]["completed_steps"] == 0
+        assert result["final_output"]["failed_steps"] == 1
+        assert result["final_output"]["overall_status"] == "partial"
+
+        step_output = result["final_output"]["step_outputs"][0]
+        assert step_output["status"] == "failed"
+        assert "Execution failed" in step_output["result"]
+
+        assert len(step_results) == 1
+        assert step_results[0]["status"] == "failed"
+
+        orch.reflector.run.assert_not_called()
+
+    def test_marks_step_failed_when_executor_returns_non_dict_payload(self, tmp_path):
+        import core.memory as mem
+        from core.memory import get_step_results
+        from core.orchestrator import Orchestrator
+
+        original_db_path = mem.DB_PATH
+        mem.DB_PATH = tmp_path / "orchestrator_test_invalid_payload.db"
+
+        try:
+            orch = Orchestrator(model="mistral", enable_reflection=True)
+            orch.planner = MagicMock()
+            orch.researcher = MagicMock()
+            orch.executor = MagicMock()
+            orch.reflector = MagicMock()
+
+            orch.planner.run.return_value = {
+                "goal": "Build feature",
+                "steps": ["Implement feature"],
+                "estimated_complexity": "low",
+            }
+            orch.researcher.run.return_value = {
+                "step": "Implement feature",
+                "details": "Use robust validation.",
+                "resources": [],
+                "best_practices": [],
+                "pitfalls": [],
+            }
+            orch.executor.run.return_value = "invalid payload"
+
+            result = orch.run("Build feature")
+            step_results = get_step_results(result["task_id"])
+        finally:
+            mem.DB_PATH = original_db_path
+
+        assert result["final_output"]["completed_steps"] == 0
+        assert result["final_output"]["failed_steps"] == 1
+        assert result["final_output"]["overall_status"] == "partial"
+
+        step_output = result["final_output"]["step_outputs"][0]
+        assert step_output["status"] == "failed"
+        assert "invalid payload type" in step_output["result"].lower()
+
+        assert len(step_results) == 1
+        assert step_results[0]["status"] == "failed"
+
+        orch.reflector.run.assert_not_called()
+
+    def test_keeps_step_completed_when_executor_returns_completed_status(self, tmp_path):
+        import core.memory as mem
+        from core.memory import get_step_results
+        from core.orchestrator import Orchestrator
+
+        original_db_path = mem.DB_PATH
+        mem.DB_PATH = tmp_path / "orchestrator_test_completed_status.db"
+
+        try:
+            orch = Orchestrator(model="mistral", enable_reflection=False)
+            orch.planner = MagicMock()
+            orch.researcher = MagicMock()
+            orch.executor = MagicMock()
+
+            orch.planner.run.return_value = {
+                "goal": "Build feature",
+                "steps": ["Implement feature"],
+                "estimated_complexity": "low",
+            }
+            orch.researcher.run.return_value = {
+                "step": "Implement feature",
+                "details": "Use robust validation.",
+                "resources": [],
+                "best_practices": [],
+                "pitfalls": [],
+            }
+            orch.executor.run.return_value = {
+                "step": "Implement feature",
+                "result": "Feature implemented successfully",
+                "status": "completed",
+                "confidence": 0.9,
+            }
+
+            result = orch.run("Build feature")
+            step_results = get_step_results(result["task_id"])
+        finally:
+            mem.DB_PATH = original_db_path
+
+        assert result["final_output"]["completed_steps"] == 1
+        assert result["final_output"]["failed_steps"] == 0
+        assert result["final_output"]["overall_status"] == "completed"
+
+        step_output = result["final_output"]["step_outputs"][0]
+        assert step_output["status"] == "completed"
+        assert "implemented successfully" in step_output["result"].lower()
+
+        assert len(step_results) == 1
+        assert step_results[0]["status"] == "completed"
+
 
 # ---------------------------------------------------------------------------
 # utils.helpers
