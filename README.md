@@ -214,18 +214,6 @@ Response:
 
 Poll job state, progress events, and final result.
 
-### `POST /run-task-async/{job_id}/cancel`
-
-Request cancellation for a queued or running async job.
-
-### `POST /run-task-async/cleanup`
-
-Delete old terminal async jobs (`completed`, `failed`, `cancelled`) using a retention window.
-
-Query options for async retention controls:
-- `retention_hours` on `POST /run-task-async` and `GET /run-task-async/{job_id}` (optional override)
-- `retention_hours` on `POST /run-task-async/cleanup` (required by API schema default)
-
 ### `GET /history`
 
 Returns the 20 most recent tasks (configurable via `?limit=N`).
@@ -359,7 +347,6 @@ MyAgent = load_agent_plugin("plugins.my_agent.MyAgent")
 | `SYNAPSE_CORS_ALLOW_CREDENTIALS` | `true` | Enables credentialed CORS |
 | `SYNAPSE_CORS_ORIGINS` | localhost defaults in dev | Comma-separated allowed origins |
 | `SYNAPSE_HISTORY_LIMIT` | `20` | Default `/history` limit |
-| `SYNAPSE_ASYNC_JOB_RETENTION_HOURS` | `24` | Default async job retention TTL for cleanup |
 | `OLLAMA_CONNECT_TIMEOUT_S` | `10` | Ollama connect timeout (seconds) |
 | `OLLAMA_READ_TIMEOUT_S` | `60` | Ollama read timeout (seconds) |
 | `OLLAMA_RETRIES` | `1` | LLM request retry attempts |
