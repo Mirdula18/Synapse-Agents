@@ -299,15 +299,6 @@ hints = search_knowledge("FastAPI routing")
 
 ---
 
-## Running Tests
-
-```bash
-pytest tests/ -v
-```
-
-All 64 tests run completely offline (Ollama is mocked).
-
----
 
 ## Plugin System
 
