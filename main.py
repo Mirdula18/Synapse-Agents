@@ -1,16 +1,4 @@
-"""
-main.py – Application entry point.
 
-Usage:
-    # Start the API server (default port 8000):
-    python main.py
-
-    # Run a task directly from the CLI (offline, no HTTP server needed):
-    python main.py --cli --goal "Build me a portfolio website"
-
-    # Interactive mode (approve plan before execution):
-    python main.py --cli --interactive --goal "Set up a FastAPI project"
-"""
 
 from __future__ import annotations
 
