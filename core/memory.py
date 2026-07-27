@@ -46,8 +46,14 @@ def _get_conn() -> Generator[sqlite3.Connection, None, None]:
 
 
 def init_db() -> None:
-    """Create tables if they do not already exist."""
+    """Create tables if they do not already exist.
+
+    Enables WAL journal mode and sets a busy-timeout so concurrent writers
+    wait briefly instead of immediately raising ``database is locked``.
+    """
     with _get_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS tasks (
@@ -77,6 +83,9 @@ def init_db() -> None:
                 keyword     TEXT    NOT NULL,
                 content     TEXT    NOT NULL,
                 source_task INTEGER REFERENCES tasks(id),
+                quality_score REAL  DEFAULT NULL,
+                provenance  TEXT    DEFAULT NULL,
+                verified    INTEGER DEFAULT 0,
                 created_at  TEXT    NOT NULL
             );
 
@@ -104,6 +113,16 @@ def init_db() -> None:
                 ON async_jobs(status, updated_at DESC);
             """
         )
+        # Migrations for existing databases (safe to run repeatedly)
+        for col, typedef in [
+            ("quality_score", "REAL DEFAULT NULL"),
+            ("provenance", "TEXT DEFAULT NULL"),
+            ("verified", "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE knowledge_base ADD COLUMN {col} {typedef}")  # noqa: S608
+            except sqlite3.OperationalError:
+                pass  # Column already exists
     logger.info("Database initialised at %s", DB_PATH)
 
 
@@ -123,6 +142,9 @@ def create_task(goal: str) -> int:
         return cur.lastrowid  # type: ignore[return-value]
 
 
+_TASK_UPDATE_COLUMNS: set[str] = {"status", "plan", "final_output", "updated_at"}
+
+
 def update_task(
     task_id: int,
     status: str | None = None,
@@ -130,23 +152,30 @@ def update_task(
     final_output: dict[str, Any] | None = None,
 ) -> None:
     """Partial update a task record."""
-    fields: list[str] = ["updated_at = ?"]
-    values: list[Any] = [_now()]
+    assignments: list[str] = []
+    values: list[Any] = []
 
     if status is not None:
-        fields.append("status = ?")
+        assignments.append("status = ?")
         values.append(status)
     if plan is not None:
-        fields.append("plan = ?")
+        assignments.append("plan = ?")
         values.append(json.dumps(plan))
     if final_output is not None:
-        fields.append("final_output = ?")
+        assignments.append("final_output = ?")
         values.append(json.dumps(final_output))
 
+    if not assignments:
+        return
+
+    assignments.append("updated_at = ?")
+    values.append(_now())
     values.append(task_id)
+
+    set_clause = ", ".join(assignments)
     with _get_conn() as conn:
         conn.execute(
-            f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?",  # noqa: S608
+            f"UPDATE tasks SET {set_clause} WHERE id = ?",  # noqa: S608
             values,
         )
 
@@ -377,34 +406,92 @@ def cleanup_async_jobs(retention_hours: int = 24, now_ts: float | None = None) -
         return cur.rowcount
 
 
+def reset_orphaned_async_jobs() -> int:
+    """Reset any jobs stuck in 'running' or 'cancelling' to 'failed' on startup.
+
+    Returns the number of jobs reset.
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(
+            """UPDATE async_jobs
+               SET status = 'failed',
+                   error = 'Server restarted while job was running.',
+                   updated_at = ?
+               WHERE status IN ('running', 'cancelling')""",
+            (_now_ts(),),
+        )
+        return cur.rowcount
+
+
 # ---------------------------------------------------------------------------
 # Knowledge base
 # ---------------------------------------------------------------------------
 
 
-def store_knowledge(keyword: str, content: str, source_task: int | None = None) -> None:
-    """Store a reusable piece of knowledge."""
+def store_knowledge(
+    keyword: str,
+    content: str,
+    source_task: int | None = None,
+    quality_score: float | None = None,
+    provenance: str | None = None,
+) -> None:
+    """Store a reusable piece of knowledge.
+
+    Only knowledge with a quality_score above the threshold should be stored
+    by callers — this function does not enforce the gate itself.
+    """
     with _get_conn() as conn:
         conn.execute(
-            "INSERT INTO knowledge_base (keyword, content, source_task, created_at) VALUES (?,?,?,?)",
-            (keyword.lower(), content, source_task, _now()),
+            """INSERT INTO knowledge_base
+               (keyword, content, source_task, quality_score, provenance, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (keyword.lower(), content, source_task, quality_score, provenance, _now()),
         )
 
 
-def search_knowledge(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    """Simple keyword search over the knowledge base."""
+def search_knowledge(query: str, limit: int = 5, min_quality: float = 0.0) -> list[dict[str, Any]]:
+    """Search the knowledge base, filtering by minimum quality score.
+
+    Results are ordered by quality_score DESC (NULLs last), then by id DESC.
+    """
     terms = query.lower().split()
     if not terms:
         return []
-    conditions = " OR ".join(["keyword LIKE ?"] * len(terms))
-    params = [f"%{t}%" for t in terms]
+    # Build parameterised conditions from a fixed column name — no user input
+    # reaches the SQL template itself.
+    clause = " OR ".join(["keyword LIKE ?"] * len(terms))
+    params: list[Any] = [f"%{t}%" for t in terms]
+    params.append(min_quality)
     params.append(limit)
+    sql = (
+        "SELECT * FROM knowledge_base WHERE ("
+        + clause
+        + ") AND (quality_score IS NULL OR quality_score >= ?) "
+        "ORDER BY quality_score DESC NULLS LAST, id DESC LIMIT ?"
+    )
     with _get_conn() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM knowledge_base WHERE {conditions} ORDER BY id DESC LIMIT ?",  # noqa: S608
-            params,
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def prune_knowledge(max_entries: int) -> int:
+    """Remove lowest-quality entries exceeding max_entries. Returns count removed."""
+    if max_entries <= 0:
+        return 0
+    with _get_conn() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM knowledge_base").fetchone()[0]  # type: ignore[union-attr]
+        if count <= max_entries:
+            return 0
+        to_delete = count - max_entries
+        conn.execute(
+            """DELETE FROM knowledge_base WHERE id IN (
+                SELECT id FROM knowledge_base
+                ORDER BY quality_score ASC NULLS FIRST, id ASC
+                LIMIT ?
+            )""",
+            (to_delete,),
+        )
+    return to_delete
 
 
 # ---------------------------------------------------------------------------
