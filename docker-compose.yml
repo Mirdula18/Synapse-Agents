@@ -1,0 +1,15 @@
+services:
+  synapse:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - SYNAPSE_ENV=production
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - SYNAPSE_ENABLE_EXEC=false
+      - SYNAPSE_MAX_WORKERS=2
+    volumes:
+      - synapse-data:/app/data
+
+volumes:
+  synapse-data:
