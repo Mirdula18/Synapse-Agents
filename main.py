@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncGenerator
 
 import uvicorn
 from fastapi import FastAPI
@@ -13,13 +15,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from api.routes import router
+from api.routes import router, startup_init, shutdown_executor
 from core.settings import SETTINGS
 from utils.helpers import setup_logging
 
 # ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Startup / shutdown lifecycle managed by FastAPI."""
+    startup_init()
+    yield
+    shutdown_executor()
+
 
 app = FastAPI(
     title="Synapse Agents",
@@ -30,6 +41,7 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
