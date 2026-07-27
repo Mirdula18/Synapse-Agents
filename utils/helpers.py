@@ -110,44 +110,60 @@ def extract_code_blocks(text: str) -> list[dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Safe shell execution
+# Safe shell execution (F6: sandboxed, opt-in)
 # ---------------------------------------------------------------------------
 
-_ALLOWED_COMMANDS: set[str] = {
+# Narrow whitelist: read-only / informational commands only.
+# Never add python, pip, node, npm, git, or any command that can modify state.
+_SANDBOX_WHITELIST: set[str] = {
     "echo",
     "ls",
     "pwd",
     "cat",
-    "python",
-    "python3",
-    "pip",
-    "pip3",
-    "node",
-    "npm",
-    "git",
 }
+
+_SANDBOX_MAX_OUTPUT = 64 * 1024  # 64 KiB stdout+stderr cap
+_SANDBOX_DEFAULT_TIMEOUT = 15  # seconds
 
 
 def safe_shell(
     command: list[str],
-    timeout: int = 30,
+    timeout: int = _SANDBOX_DEFAULT_TIMEOUT,
     allowed_commands: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Execute a shell command in safe mode.
+    """Execute a shell command in a restricted sandbox.
 
-    Only commands whose base name appears in *allowed_commands* (or the
-    built-in whitelist) are permitted.  Returns a dict with stdout/stderr/
-    return_code keys.
+    Only commands in the narrow whitelist are permitted.  The sandbox
+    enforces a timeout and output-size cap.  Executor-agent output must
+    NEVER be passed to this function — it is for trusted utilities only.
+
+    Gated by ``SYNAPSE_ENABLE_EXEC`` — returns a disabled error unless
+    the environment variable is set to a truthy value.
     """
-    allowed = allowed_commands or _ALLOWED_COMMANDS
+    from core.settings import SETTINGS
+
+    if not SETTINGS.enable_exec:
+        return {
+            "stdout": "",
+            "stderr": (
+                "Command execution is disabled. "
+                "Set SYNAPSE_ENABLE_EXEC=true to enable (not recommended in production)."
+            ),
+            "return_code": 1,
+        }
+
+    allowed = allowed_commands if allowed_commands is not None else _SANDBOX_WHITELIST
+
     if not command:
         return {"stdout": "", "stderr": "Empty command", "return_code": 1}
 
     base = Path(command[0]).name
     if base not in allowed:
-        msg = f"Command '{base}' is not in the safe-command whitelist."
+        msg = f"Command '{base}' is not in the sandbox whitelist."
         logger.warning("safe_shell blocked: %s", msg)
         return {"stdout": "", "stderr": msg, "return_code": 1}
+
+    timeout = min(timeout, _SANDBOX_DEFAULT_TIMEOUT)
 
     try:
         if os.name == "nt" and base == "echo":
@@ -157,21 +173,20 @@ def safe_shell(
                 text=True,
                 timeout=timeout,
             )
-            return {
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "return_code": result.returncode,
-            }
+        else:
+            # Ephemeral workdir, no shell injection, captured I/O.
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
 
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        stdout = result.stdout[:_SANDBOX_MAX_OUTPUT]
+        stderr = result.stderr[:_SANDBOX_MAX_OUTPUT]
         return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            "stdout": stdout,
+            "stderr": stderr,
             "return_code": result.returncode,
         }
     except subprocess.TimeoutExpired:
