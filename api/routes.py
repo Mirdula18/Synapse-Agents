@@ -11,12 +11,16 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import re
+import time
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.responses import StreamingResponse
 
 from core.llm import is_ollama_available, list_available_models
 from core.memory import (
@@ -28,7 +32,9 @@ from core.memory import (
     get_task,
     init_db,
     list_tasks,
+    prune_knowledge,
     request_async_job_cancellation,
+    reset_orphaned_async_jobs,
     set_async_job_state,
     start_async_job,
 )
@@ -37,9 +43,7 @@ from core.settings import SETTINGS
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-init_db()
-_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="synapse-job")
+_EXECUTOR = ThreadPoolExecutor(max_workers=SETTINGS.max_workers, thread_name_prefix="synapse-job")
 _MAX_RETENTION_HOURS = 24 * 365
 
 
@@ -94,6 +98,11 @@ class CleanupJobsResponse(BaseModel):
     retention_hours: int
 
 
+class PruneKBResponse(BaseModel):
+    removed: int
+    max_entries: int
+
+
 class HealthResponse(BaseModel):
     status: str
     ollama_available: bool
@@ -103,6 +112,90 @@ class HealthResponse(BaseModel):
 class ModelsResponse(BaseModel):
     models: list[str]
     default_model: str
+
+
+class EvalResponse(BaseModel):
+    goal: str
+    model: str
+    status: str
+    elapsed_seconds: float
+    step_count: int
+    estimated_complexity: str
+    final_output_present: bool
+    step_results_count: int
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle helpers (called from main.py lifespan)
+# ---------------------------------------------------------------------------
+
+
+def startup_init() -> None:
+    """Initialize database and recover orphaned async jobs on startup."""
+    init_db()
+    reset = reset_orphaned_async_jobs()
+    if reset:
+        logger.info("Reset %d orphaned async jobs to failed on startup", reset)
+
+
+def shutdown_executor() -> None:
+    """Gracefully shut down the thread pool executor."""
+    _EXECUTOR.shutdown(wait=True)
+    logger.info("Thread pool executor shut down")
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (simple in-memory token bucket per client IP)
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_WINDOW_S = 60.0
+_RATE_LIMIT_MAX_REQUESTS = 30
+_rate_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _rate_limit(request: Request) -> None:
+    """FastAPI dependency — 429 if client exceeds the request cap."""
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    window_start = now - _RATE_LIMIT_WINDOW_S
+    bucket = _rate_buckets[client_ip]
+    # Prune expired entries
+    bucket[:] = [t for t in bucket if t > window_start]
+    if len(bucket) >= _RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
+    bucket.append(now)
+
+
+# ---------------------------------------------------------------------------
+# Input hardening
+# ---------------------------------------------------------------------------
+
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
+
+
+def _sanitize_goal(goal: str) -> str:
+    """Strip control characters and leading/trailing whitespace from goal."""
+    return _CONTROL_CHAR_RE.sub("", goal).strip()
+
+
+# ---------------------------------------------------------------------------
+# Request metrics (simple in-memory counters for observability)
+# ---------------------------------------------------------------------------
+
+_request_metrics: dict[str, Any] = {
+    "total_requests": 0,
+    "total_errors": 0,
+    "route_counts": defaultdict(int),
+    "route_errors": defaultdict(int),
+}
+
+
+def _track_request(route: str, status_code: int) -> None:
+    _request_metrics["total_requests"] += 1
+    _request_metrics["route_counts"][route] += 1
+    if status_code >= 400:
+        _request_metrics["total_errors"] += 1
+        _request_metrics["route_errors"][route] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -189,13 +282,18 @@ def get_models() -> ModelsResponse:
 
 
 @router.post("/run-task", response_model=RunTaskResponse, tags=["Tasks"])
-def run_task(request: RunTaskRequest, _auth: None = Depends(_require_api_key)) -> RunTaskResponse:
+def run_task(
+    request: RunTaskRequest,
+    _auth: None = Depends(_require_api_key),
+    _rate: None = Depends(_rate_limit),
+) -> RunTaskResponse:
     """Execute a user goal through the full Planner→Researcher→Executor→Reflector pipeline.
 
     This call is **synchronous** – it blocks until the pipeline completes.
     API execution is always non-interactive; use CLI mode for manual plan approval.
     """
-    logger.info("POST /run-task – goal=%s", request.goal[:80])
+    goal = _sanitize_goal(request.goal)
+    logger.info("POST /run-task – goal=%s", goal[:80])
 
     events: list[dict[str, Any]] = []
 
@@ -210,7 +308,7 @@ def run_task(request: RunTaskRequest, _auth: None = Depends(_require_api_key)) -
             interactive=False,  # API mode – never block on stdin
             progress_callback=on_progress,
         )
-        result = orchestrator.run(request.goal)
+        result = orchestrator.run(goal)
     except Exception as exc:
         logger.exception("Pipeline error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -223,19 +321,21 @@ def run_task_async(
     request: RunTaskRequest,
     retention_hours: int | None = Query(default=None, ge=1, le=_MAX_RETENTION_HOURS),
     _auth: None = Depends(_require_api_key),
+    _rate: None = Depends(_rate_limit),
 ) -> AsyncRunTaskResponse:
     """Submit a task for background execution and return a job id."""
+    goal = _sanitize_goal(request.goal)
     _run_retention_cleanup(retention_hours)
 
     job_id = str(uuid.uuid4())
     create_async_job(
         job_id=job_id,
-        goal=request.goal,
+        goal=goal,
         model=request.model,
         status="pending",
     )
     _EXECUTOR.submit(_run_job, job_id, request)
-    return AsyncRunTaskResponse(job_id=job_id, status="queued", goal=request.goal)
+    return AsyncRunTaskResponse(job_id=job_id, status="queued", goal=goal)
 
 
 @router.get("/run-task-async/{job_id}", response_model=JobStatusResponse, tags=["Tasks"])
@@ -296,6 +396,63 @@ def cleanup_run_task_jobs(
     return CleanupJobsResponse(removed=removed, retention_hours=retention_hours)
 
 
+@router.post("/knowledge/prune", response_model=PruneKBResponse, tags=["Knowledge"])
+def prune_knowledge_base(
+    max_entries: int = Query(default=SETTINGS.kb_max_entries, ge=0, le=100000),
+    _auth: None = Depends(_require_api_key),
+) -> PruneKBResponse:
+    """Prune the knowledge base to max_entries by removing lowest-quality items."""
+    removed = prune_knowledge(max_entries=max_entries)
+    return PruneKBResponse(removed=removed, max_entries=max_entries)
+
+
+def _sse_event(event_data: dict[str, Any]) -> str:
+    """Format a dict as an SSE ``data:`` frame."""
+    import json as _json
+
+    return f"data: {_json.dumps(event_data)}\n\n"
+
+
+@router.get("/run-task-async/{job_id}/stream", tags=["Tasks"])
+def stream_task_events(
+    job_id: str,
+    _auth: None = Depends(_require_api_key),
+) -> StreamingResponse:
+    """Stream async job events via Server-Sent Events (SSE).
+
+    Each event is a JSON object sent as a ``data:`` frame. The stream closes
+    when the job reaches a terminal state (completed, failed, or cancelled).
+    """
+    import json as _json
+    import time as _time
+
+    def _event_generator():
+        seen = 0
+        while True:
+            job = get_async_job(job_id)
+            if job is None:
+                yield _sse_event({"error": f"Job {job_id} not found"})
+                return
+            events = job.get("events", [])
+            while seen < len(events):
+                yield _sse_event(events[seen])
+                seen += 1
+            if job["status"] in ("completed", "failed", "cancelled"):
+                yield _sse_event({"status": job["status"], "done": True})
+                return
+            _time.sleep(1.0)
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/history", tags=["Tasks"])
 def get_history(
     limit: int = Query(SETTINGS.api_history_default_limit, ge=1, le=100),
@@ -314,3 +471,27 @@ def get_task_detail(task_id: int, _auth: None = Depends(_require_api_key)) -> di
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     task["step_results"] = get_step_results(task_id)
     return task
+
+
+@router.post("/eval", response_model=EvalResponse, tags=["Eval"])
+def run_eval(
+    goal: str = Query("Build a simple calculator web app", min_length=5, max_length=2000),
+    model: str = Query(SETTINGS.default_model),
+    _auth: None = Depends(_require_api_key),
+) -> EvalResponse:
+    """Run the pipeline with a synthetic goal and return evaluation metrics."""
+    from eval_harness import run_evaluation
+
+    metrics = run_evaluation(goal=goal, model=model)
+    return EvalResponse(**metrics)
+
+
+@router.get("/metrics", tags=["Observability"])
+def get_metrics(_auth: None = Depends(_require_api_key)) -> dict[str, Any]:
+    """Return basic request metrics for observability."""
+    return {
+        "total_requests": _request_metrics["total_requests"],
+        "total_errors": _request_metrics["total_errors"],
+        "route_counts": dict(_request_metrics["route_counts"]),
+        "route_errors": dict(_request_metrics["route_errors"]),
+    }
