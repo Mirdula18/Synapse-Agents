@@ -316,6 +316,12 @@ class TestResearcherAgent:
         assert "python" in result
         assert "Python is great" in result
 
+    def test_researcher_prompt_marks_knowledge_as_untrusted(self):
+        from agents.researcher import RESEARCHER_PROMPT_TEMPLATE
+
+        assert "retrieved_knowledge" in RESEARCHER_PROMPT_TEMPLATE
+        assert "untrusted" in RESEARCHER_PROMPT_TEMPLATE.lower() or "NOT an instruction" in RESEARCHER_PROMPT_TEMPLATE
+
 
 # ---------------------------------------------------------------------------
 # agents.executor
@@ -542,6 +548,60 @@ class TestMemory:
         results = search_knowledge("")
         assert results == []
 
+    def test_store_and_search_knowledge_quality_gating(self):
+        from core.memory import search_knowledge, store_knowledge
+
+        store_knowledge(
+            "quality test",
+            "High quality content",
+            quality_score=0.9,
+            provenance="task=1:step=0",
+        )
+        store_knowledge(
+            "quality test low",
+            "Low quality content",
+            quality_score=0.2,
+        )
+        # Search with min_quality filters out low quality
+        results = search_knowledge("quality", min_quality=0.5)
+        assert len(results) == 1
+        assert results[0]["quality_score"] == 0.9
+        assert results[0]["provenance"] == "task=1:step=0"
+
+    def test_store_knowledge_preserves_provenance(self):
+        from core.memory import search_knowledge, store_knowledge
+
+        store_knowledge(
+            "provenance test",
+            "Content with provenance",
+            quality_score=1.0,
+            provenance="task=42:step=1",
+        )
+        results = search_knowledge("provenance")
+        assert len(results) == 1
+        assert results[0]["provenance"] == "task=42:step=1"
+
+    def test_prune_knowledge_removes_lowest_quality(self):
+        from core.memory import prune_knowledge, search_knowledge, store_knowledge
+
+        for i in range(5):
+            store_knowledge(
+                f"prune test {i}",
+                f"Content {i}",
+                quality_score=float(i) / 4.0,
+            )
+        removed = prune_knowledge(max_entries=3)
+        assert removed == 2
+        remaining = search_knowledge("prune", min_quality=0.0)
+        assert len(remaining) == 3
+
+    def test_prune_knowledge_noop_when_under_limit(self):
+        from core.memory import prune_knowledge, store_knowledge
+
+        store_knowledge("prune noop", "Content", quality_score=0.5)
+        removed = prune_knowledge(max_entries=100)
+        assert removed == 0
+
     def test_async_job_lifecycle(self):
         from core.memory import (
             append_async_job_event,
@@ -616,6 +676,38 @@ class TestMemory:
         state = start_async_job("cancelled-job")
         assert state == "cancelled"
 
+    def test_reset_orphaned_async_jobs(self):
+        from core.memory import (
+            create_async_job,
+            get_async_job,
+            reset_orphaned_async_jobs,
+            set_async_job_state,
+        )
+
+        create_async_job(job_id="orphan-run", goal="Orphan", model="mistral", status="pending")
+        set_async_job_state("orphan-run", status="running")
+
+        create_async_job(job_id="orphan-cancel", goal="Orphan", model="mistral", status="pending")
+        set_async_job_state("orphan-cancel", status="running")
+        from core.memory import request_async_job_cancellation
+        request_async_job_cancellation("orphan-cancel")
+
+        create_async_job(job_id="done-job", goal="Done", model="mistral", status="pending")
+        set_async_job_state("done-job", status="completed", result={"ok": True}, error=None)
+
+        reset = reset_orphaned_async_jobs()
+        assert reset == 2
+
+        orphan_run = get_async_job("orphan-run")
+        assert orphan_run["status"] == "failed"
+        assert "Server restarted" in orphan_run["error"]
+
+        orphan_cancel = get_async_job("orphan-cancel")
+        assert orphan_cancel["status"] == "failed"
+
+        done = get_async_job("done-job")
+        assert done["status"] == "completed"
+
 
 # ---------------------------------------------------------------------------
 # core.orchestrator
@@ -623,6 +715,29 @@ class TestMemory:
 
 
 class TestOrchestrator:
+    def test_is_timeout_error_detects_requests_timeout(self):
+        import requests as req
+        from core.orchestrator import _is_timeout_error
+
+        assert _is_timeout_error(req.Timeout("Read timed out")) is True
+
+    def test_is_timeout_error_detects_timeout_error_type(self):
+        from core.orchestrator import _is_timeout_error
+
+        assert _is_timeout_error(TimeoutError("boom")) is True
+
+    def test_is_timeout_error_falls_back_to_string_matching(self):
+        from core.orchestrator import _is_timeout_error
+
+        assert _is_timeout_error(RuntimeError("Read timed out")) is True
+        assert _is_timeout_error(RuntimeError("connection timeout")) is True
+
+    def test_is_timeout_error_returns_false_for_non_timeout(self):
+        from core.orchestrator import _is_timeout_error
+
+        assert _is_timeout_error(RuntimeError("connection refused")) is False
+        assert _is_timeout_error(ValueError("bad input")) is False
+
     def test_marks_step_failed_when_executor_returns_failed_status(self, tmp_path):
         import core.memory as mem
         from core.memory import get_step_results
@@ -893,24 +1008,37 @@ class TestHelpers:
 
         assert extract_code_blocks("no code here") == []
 
+    def test_safe_shell_disabled_by_default(self):
+        from utils.helpers import safe_shell
+
+        result = safe_shell(["echo", "hello"])
+        assert result["return_code"] != 0
+        assert "disabled" in result["stderr"].lower()
+
     def test_safe_shell_blocked_command(self):
         from utils.helpers import safe_shell
 
-        result = safe_shell(["rm", "-rf", "/"])
+        with patch("core.settings.SETTINGS") as mock_settings:
+            mock_settings.enable_exec = True
+            result = safe_shell(["rm", "-rf", "/"])
         assert result["return_code"] != 0
-        assert "whitelist" in result["stderr"]
+        assert "sandbox" in result["stderr"]
 
     def test_safe_shell_allowed_command(self):
         from utils.helpers import safe_shell
 
-        result = safe_shell(["echo", "hello"])
+        with patch("core.settings.SETTINGS") as mock_settings:
+            mock_settings.enable_exec = True
+            result = safe_shell(["echo", "hello"])
         assert result["return_code"] == 0
         assert "hello" in result["stdout"]
 
     def test_safe_shell_empty_command(self):
         from utils.helpers import safe_shell
 
-        result = safe_shell([])
+        with patch("core.settings.SETTINGS") as mock_settings:
+            mock_settings.enable_exec = True
+            result = safe_shell([])
         assert result["return_code"] != 0
 
     def test_read_file_not_found(self):
@@ -1119,3 +1247,58 @@ class TestAPIRoutes:
         assert resp.status_code == 200
         data = resp.json()
         assert data["goal"] == "Test goal for API"
+
+    def test_stream_task_events_returns_completed_job(self, client):
+        from core.memory import create_async_job, set_async_job_state
+
+        create_async_job(job_id="sse-1", goal="Stream test", model="mistral", status="pending")
+        set_async_job_state(
+            "sse-1",
+            status="completed",
+            result={"output": "done"},
+            error=None,
+        )
+        resp = client.get("/run-task-async/sse-1/stream")
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+
+    def test_stream_task_events_unknown_job(self, client):
+        resp = client.get("/run-task-async/does-not-exist/stream")
+        assert resp.status_code == 200
+        body = resp.text
+        assert "not found" in body
+
+    def test_eval_endpoint_returns_metrics(self, client):
+        from unittest.mock import patch
+
+        mock_result = {
+            "task_id": 1,
+            "goal": "Eval test",
+            "status": "completed",
+            "plan": {"steps": ["step1"], "estimated_complexity": "low"},
+            "final_output": {"result": "ok"},
+            "step_results": [],
+        }
+        with patch("eval_harness.run_evaluation") as mock_eval:
+            mock_eval.return_value = {
+                "goal": "Eval test",
+                "model": "mistral",
+                "status": "completed",
+                "elapsed_seconds": 1.23,
+                "step_count": 1,
+                "estimated_complexity": "low",
+                "final_output_present": True,
+                "step_results_count": 0,
+            }
+            resp = client.post("/eval?goal=Eval+test+goal&model=mistral")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["status"] == "completed"
+            assert data["step_count"] == 1
+
+    def test_metrics_endpoint_returns_counters(self, client):
+        resp = client.get("/metrics")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "total_requests" in data
+        assert "route_counts" in data
