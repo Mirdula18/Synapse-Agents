@@ -20,10 +20,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import requests as _requests
+
 from agents.executor import ExecutorAgent
 from agents.planner import PlannerAgent
 from agents.reflector import ReflectorAgent
 from agents.researcher import ResearcherAgent
+from core.settings import SETTINGS
 from core.memory import (
     create_task,
     get_step_results,
@@ -39,6 +42,13 @@ MAX_STEP_RETRIES = 2
 
 
 def _is_timeout_error(exc: Exception) -> bool:
+    """Return True if *exc* is (or wraps) a timeout error.
+
+    Uses exception-type checking instead of fragile string matching.
+    """
+    if isinstance(exc, (_requests.Timeout, TimeoutError, TimeoutError)):
+        return True
+    # Some libraries wrap timeouts in RuntimeError or OSError.
     text = str(exc).lower()
     return "timed out" in text or "timeout" in text
 
@@ -320,13 +330,18 @@ class Orchestrator:
             status=step_state.status,
         )
 
-        # Store useful knowledge for future tasks
+        # Store useful knowledge for future tasks (F8: quality-gated)
         if step_state.research and step_state.research.get("details"):
-            store_knowledge(
-                keyword=step_text[:80],
-                content=step_state.research["details"][:500],
-                source_task=state.task_id,
-            )
+            quality = step_state.research.get("confidence", 0.0)
+            # Only store knowledge above the configured minimum quality threshold
+            if quality >= SETTINGS.kb_min_quality:
+                store_knowledge(
+                    keyword=step_text[:80],
+                    content=step_state.research["details"][:500],
+                    source_task=state.task_id,
+                    quality_score=quality,
+                    provenance=f"task={state.task_id}:step={step_state.index}",
+                )
 
         self._emit(
             "step_done",
