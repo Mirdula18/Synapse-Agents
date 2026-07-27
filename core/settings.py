@@ -101,6 +101,11 @@ class Settings:
     ollama_temperature: float
     api_history_default_limit: int
     async_job_retention_hours: int
+    enable_exec: bool
+    max_workers: int
+    database_url: str | None
+    kb_min_quality: float
+    kb_max_entries: int
 
 
 def _normalise_environment(value: str | None) -> str:
@@ -172,6 +177,17 @@ def load_settings() -> Settings:
             24,
             minimum=1,
         ),
+        enable_exec=_as_bool(os.getenv("SYNAPSE_ENABLE_EXEC"), False),
+        max_workers=_as_int(os.getenv("SYNAPSE_MAX_WORKERS"), 2, minimum=1),
+        database_url=os.getenv("DATABASE_URL"),
+        kb_min_quality=_as_float(
+            os.getenv("SYNAPSE_KB_MIN_QUALITY"),
+            0.5,
+            var_name="SYNAPSE_KB_MIN_QUALITY",
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        kb_max_entries=_as_int(os.getenv("SYNAPSE_KB_MAX_ENTRIES"), 1000, minimum=0),
     )
 
 
