@@ -33,7 +33,7 @@ User Goal ──► Planner ──► Researcher ──► Executor ──► Re
 ├── frontend/
 │   └── index.html       # Single-file React-free UI (served by FastAPI)
 ├── tests/
-│   └── test_agents.py   # 64 unit tests (all offline, fully mocked)
+│   └── test_agents.py   # 76 unit tests (all offline, fully mocked)
 ├── main.py              # Entry point (API server or CLI)
 └── requirements.txt
 ```
@@ -295,7 +295,7 @@ hints = search_knowledge("FastAPI routing")
 | File reader / writer utilities | ✅ |
 | Plugin system (dynamic agent loading) | ✅ |
 | Progress callback / streaming | ✅ |
-| Full unit test suite (64 tests) | ✅ |
+| Full unit test suite (76 tests) | ✅ |
 
 ---
 
