@@ -478,8 +478,10 @@ const POLL_BASE_INTERVAL_MS = 1200;
 const POLL_MAX_INTERVAL_MS = 8000;
 const POLL_MAX_TRANSIENT_ERRORS = 6;
 const POLL_TIMEOUT_MS = 20 * 60 * 1000;
+const SSE_TIMEOUT_MS = 20 * 60 * 1000;
 
 let ACTIVE_JOB_ID = null;
+let ACTIVE_EVENT_SOURCE = null;
 
 function getApiKey() {
   try {
@@ -610,6 +612,12 @@ function setRunUiBusy(isBusy) {
 async function cancelActiveTask() {
   if (!ACTIVE_JOB_ID) {
     return;
+  }
+
+  // Close SSE stream if active
+  if (ACTIVE_EVENT_SOURCE) {
+    ACTIVE_EVENT_SOURCE.close();
+    ACTIVE_EVENT_SOURCE = null;
   }
 
   const cancelBtn = document.getElementById('cancel-btn');
@@ -781,12 +789,94 @@ async function runTask() {
     }
     addTimelineItem('error', '❌', 'Pipeline failed', msg);
   } finally {
+    if (ACTIVE_EVENT_SOURCE) {
+      ACTIVE_EVENT_SOURCE.close();
+      ACTIVE_EVENT_SOURCE = null;
+    }
     ACTIVE_JOB_ID = null;
     setRunUiBusy(false);
   }
 }
 
 async function waitForJob(jobId) {
+  // Try EventSource (SSE) first, fall back to polling if it fails
+  try {
+    return await waitForJobSSE(jobId);
+  } catch (sseErr) {
+    if (sseErr.code === 'SSE_UNSUPPORTED') {
+      addTimelineItem('refl', '📡', 'SSE unavailable', 'Falling back to polling mode');
+    }
+    return await waitForJobPoll(jobId);
+  }
+}
+
+function waitForJobSSE(jobId) {
+  return new Promise((resolve, reject) => {
+    if (typeof EventSource === 'undefined') {
+      const err = new Error('EventSource not supported by this browser.');
+      err.code = 'SSE_UNSUPPORTED';
+      return reject(err);
+    }
+
+    const params = new URLSearchParams({ t: Date.now().toString() });
+    const apiKey = getApiKey();
+    if (apiKey) {
+      params.set('api_key', apiKey);
+    }
+
+    const url = `${API}/run-task-async/${encodeURIComponent(jobId)}/stream?${params}`;
+    const es = new EventSource(url);
+    ACTIVE_EVENT_SOURCE = es;
+
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      es.close();
+      ACTIVE_EVENT_SOURCE = null;
+      reject(makeHttpError(408, 'SSE stream exceeded the maximum wait time.', 'POLL_TIMEOUT'));
+    }, SSE_TIMEOUT_MS);
+
+    es.onmessage = function (event) {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.error) {
+          clearTimeout(timeoutId);
+          es.close();
+          ACTIVE_EVENT_SOURCE = null;
+          reject(new Error(data.error));
+          return;
+        }
+        if (data.done) {
+          clearTimeout(timeoutId);
+          es.close();
+          ACTIVE_EVENT_SOURCE = null;
+          // Fetch the final job state
+          apiFetch(`/run-task-async/${encodeURIComponent(jobId)}`)
+            .then(r => r.json())
+            .then(resolve)
+            .catch(reject);
+          return;
+        }
+        renderEvent(data);
+      } catch {
+        // Ignore parse errors from SSE frames
+      }
+    };
+
+    es.onerror = function () {
+      if (timedOut) return;
+      // EventSource will auto-reconnect; only reject if readyState is CLOSED
+      if (es.readyState === EventSource.CLOSED) {
+        clearTimeout(timeoutId);
+        es.close();
+        ACTIVE_EVENT_SOURCE = null;
+        reject(makeHttpError(502, 'SSE connection closed unexpectedly.', 'SSE_CLOSED'));
+      }
+    };
+  });
+}
+
+async function waitForJobPoll(jobId) {
   let lastEventCount = 0;
   let consecutiveTransientErrors = 0;
   let pollIntervalMs = POLL_BASE_INTERVAL_MS;
@@ -1028,6 +1118,10 @@ loadHistory();
 // Utilities
 // ---------------------------------------------------------------------------
 function clearAll() {
+  if (ACTIVE_EVENT_SOURCE) {
+    ACTIVE_EVENT_SOURCE.close();
+    ACTIVE_EVENT_SOURCE = null;
+  }
   document.getElementById('goal-input').value = '';
   document.getElementById('progress-card').classList.add('hidden');
   document.getElementById('results-card').classList.add('hidden');

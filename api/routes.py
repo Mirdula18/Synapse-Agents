@@ -211,6 +211,19 @@ def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def _require_api_key_sse(
+    x_api_key: str | None = Header(default=None),
+    api_key: str | None = Query(default=None),
+) -> None:
+    """Auth dependency that also accepts api_key query param (for EventSource)."""
+    expected = SETTINGS.api_key
+    if not expected:
+        return
+    provided = x_api_key or api_key
+    if provided != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
 def _record_event(job_id: str, event: str, data: dict[str, Any]) -> None:
     append_async_job_event(job_id, event, data)
 
@@ -416,7 +429,7 @@ def _sse_event(event_data: dict[str, Any]) -> str:
 @router.get("/run-task-async/{job_id}/stream", tags=["Tasks"])
 def stream_task_events(
     job_id: str,
-    _auth: None = Depends(_require_api_key),
+    _auth: None = Depends(_require_api_key_sse),
 ) -> StreamingResponse:
     """Stream async job events via Server-Sent Events (SSE).
 
